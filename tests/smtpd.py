@@ -184,6 +184,54 @@ async def mock_response_ehlo_full(smtpd: SMTPD, *args: Any, **kwargs: Any) -> No
     )
 
 
+async def mock_response_ehlo_phases(smtpd: SMTPD, *args: Any, **kwargs: Any) -> None:
+    """
+    Advertise different capabilities before STARTTLS, after STARTTLS,
+    and after reconnecting.
+    """
+    if args and args[0]:
+        smtpd.session.host_name = args[0]
+    smtpd.session.extended_smtp = True
+
+    handler = smtpd.event_handler
+    connections: set[SMTPD] = getattr(handler, "ehlo_phase_connections", set())
+    connections.add(smtpd)
+    handler.ehlo_phase_connections = connections
+
+    if smtpd._tls_protocol is not None:
+        extensions = ["SIZE 2000", "8BITMIME", "AUTH PLAIN LOGIN"]
+    elif len(connections) > 1:
+        extensions = ["SIZE 3000", "AUTH PLAIN"]
+    else:
+        extensions = ["STARTTLS", "SIZE 1000", "AUTH LOGIN"]
+
+    lines = ["250-localhost"]
+    lines.extend(f"250-{extension}" for extension in extensions[:-1])
+    lines.append(f"250 {extensions[-1]}")
+    await smtpd.push("\n".join(lines))
+
+
+async def mock_response_ehlo_fail_on_reconnect(
+    smtpd: SMTPD, *args: Any, **kwargs: Any
+) -> None:
+    """
+    Accept EHLO on the first connection, reject it after reconnecting.
+    """
+    handler = smtpd.event_handler
+    connections: set[SMTPD] = getattr(handler, "ehlo_fail_connections", set())
+    connections.add(smtpd)
+    handler.ehlo_fail_connections = connections
+
+    if len(connections) > 1:
+        await smtpd.push("501 EHLO rejected")
+        return
+
+    if args and args[0]:
+        smtpd.session.host_name = args[0]
+    smtpd.session.extended_smtp = True
+    await smtpd.push("250-localhost\n250 SIZE 1000")
+
+
 async def mock_response_unavailable(smtpd: SMTPD, *args: Any, **kwargs: Any) -> None:
     await smtpd.push("421 retry in 5 minutes")
     smtpd.transport.close()

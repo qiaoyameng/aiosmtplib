@@ -4,6 +4,13 @@ Changelog
 5.1.4 (unreleased)
 ------------------
 
+- Feature: add ``SMTP.capability_snapshot``, an immutable, generation-stamped
+  view of the server's ESMTP capabilities (including the negotiation phase),
+  along with ``SMTP.add_capability_observer``/``SMTP.remove_capability_observer``
+  change notifications. Snapshots are invalidated as soon as STARTTLS succeeds
+  or the connection closes, and a new generation is only published once the
+  next EHLO completes, so stale capabilities are never reused after reconnect
+  or a failed negotiation
 - Bugfix: ``SMTPRecipientsRefused`` now exposes the ``message`` attribute shared
   by all ``SMTPException`` subclasses
 - Bugfix: resolve the ``SMTPProtocol`` close waiter on connection loss, so

@@ -34,6 +34,13 @@ Server Responses
     :members:
 
 
+Server Capabilities
+-------------------
+
+.. autoclass:: aiosmtplib.CapabilitySnapshot
+    :members:
+
+
 Status Codes
 ------------
 

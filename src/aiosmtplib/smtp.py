@@ -9,7 +9,7 @@ import email.message
 import socket
 import ssl
 from collections.abc import Iterable, Sequence
-from types import TracebackType
+from types import MappingProxyType, TracebackType
 from typing import Any, Literal
 from .auth import (
     auth_crammd5_verify,
@@ -39,7 +39,12 @@ from .errors import (
     SMTPTimeoutError,
     SMTPConnectResponseError,
 )
-from .esmtp import parse_esmtp_extensions
+from .esmtp import (
+    CapabilityObserver,
+    CapabilityPhase,
+    CapabilitySnapshot,
+    parse_esmtp_extensions,
+)
 from .protocol import SMTPProtocol, normalize_message_line_endings
 from .response import SMTPResponse
 from .typing import Default, SMTPStatus, SMTPTokenGenerator, SocketPathType
@@ -193,6 +198,9 @@ class SMTP:
         self.supports_esmtp = False
         self.server_auth_methods: list[str] = []
         self._sendmail_lock: asyncio.Lock | None = None
+        self._capability_generation = 0
+        self._capability_snapshot: CapabilitySnapshot | None = None
+        self._capability_observers: list[CapabilityObserver] = []
 
         self._validate_config()
 
@@ -241,6 +249,59 @@ class SMTP:
         self.esmtp_extensions = extensions
         self.server_auth_methods = auth_methods
         self.supports_esmtp = True
+        self._publish_capabilities(extensions, auth_methods)
+
+    @property
+    def capability_snapshot(self) -> CapabilitySnapshot | None:
+        """
+        The current immutable snapshot of server capabilities, or ``None``
+        if negotiation has not completed (or its results were invalidated
+        by STARTTLS, disconnect, or reconnect).
+        """
+        return self._capability_snapshot
+
+    def add_capability_observer(self, observer: CapabilityObserver, /) -> None:
+        """
+        Register a callback invoked with the new :class:`CapabilitySnapshot`
+        each time EHLO completes, and with ``None`` when the current
+        capabilities are invalidated (e.g. on STARTTLS or disconnect).
+        """
+        self._capability_observers.append(observer)
+
+    def remove_capability_observer(self, observer: CapabilityObserver, /) -> None:
+        """
+        Remove a callback previously registered with
+        :meth:`add_capability_observer`.
+        """
+        self._capability_observers.remove(observer)
+
+    def _notify_capability_observers(
+        self, snapshot: CapabilitySnapshot | None
+    ) -> None:
+        for observer in list(self._capability_observers):
+            observer(snapshot)
+
+    def _invalidate_capabilities(self) -> None:
+        if self._capability_snapshot is not None:
+            self._capability_snapshot = None
+            self._notify_capability_observers(None)
+
+    def _publish_capabilities(
+        self, extensions: dict[str, str], auth_methods: list[str]
+    ) -> None:
+        self._capability_generation += 1
+        tls_active = (
+            self.transport is not None
+            and self.transport.get_extra_info("sslcontext") is not None
+        )
+        phase: CapabilityPhase = "tls" if tls_active else "cleartext"
+        self._capability_snapshot = CapabilitySnapshot(
+            generation=self._capability_generation,
+            phase=phase,
+            extensions=MappingProxyType(dict(extensions)),
+            auth_methods=tuple(auth_methods),
+        )
+        self._notify_capability_observers(self._capability_snapshot)
 
     @property
     def is_ehlo_or_helo_needed(self) -> bool:
@@ -464,6 +525,10 @@ class SMTP:
         await self._connect_lock.acquire()
 
         try:
+            # A new connection starts a new capability generation; never
+            # carry capabilities over from a previous connection.
+            self._invalidate_capabilities()
+
             if self.local_hostname is None:
                 self.local_hostname = await self._get_default_local_hostname()
 
@@ -1049,6 +1114,7 @@ class SMTP:
         self.esmtp_extensions = {}
         self.supports_esmtp = False
         self.server_auth_methods = []
+        self._invalidate_capabilities()
 
     async def starttls(
         self,

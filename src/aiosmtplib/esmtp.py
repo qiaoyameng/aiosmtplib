@@ -3,9 +3,42 @@ ESMTP utils
 """
 
 import re
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from typing import Literal
 
 
-__all__ = ("parse_esmtp_extensions",)
+__all__ = ("CapabilityObserver", "CapabilitySnapshot", "parse_esmtp_extensions")
+
+
+CapabilityPhase = Literal["cleartext", "tls"]
+
+
+@dataclass(frozen=True)
+class CapabilitySnapshot:
+    """
+    An immutable view of the ESMTP capabilities advertised by the server,
+    valid for a single negotiation generation.
+
+    ``generation`` increases every time a new snapshot is published, so a
+    snapshot from a previous connection or TLS negotiation is never
+    mistaken for the current one. ``phase`` indicates whether the EHLO
+    exchange happened before ("cleartext") or after ("tls") STARTTLS.
+    """
+
+    generation: int
+    phase: CapabilityPhase
+    extensions: Mapping[str, str]
+    auth_methods: tuple[str, ...]
+
+    def supports(self, extension: str, /) -> bool:
+        """
+        Tests if the server supports the ESMTP service extension given.
+        """
+        return extension.lower() in self.extensions
+
+
+CapabilityObserver = Callable[[CapabilitySnapshot | None], None]
 
 
 OLDSTYLE_AUTH_REGEX = re.compile(r"auth=(?P<auth>.*)", flags=re.I)

@@ -47,3 +47,17 @@ async def send_message_async_context_manager() -> None:
     message = email.message.EmailMessage()
     async with aiosmtplib.SMTP(hostname="smtp.example.com") as smtp:
         await smtp.send_message(message)
+
+
+async def capability_snapshot_and_observers() -> None:
+    snapshots: list[aiosmtplib.CapabilitySnapshot | None] = []
+    async with aiosmtplib.SMTP(hostname="smtp.example.com") as smtp:
+        smtp.add_capability_observer(snapshots.append)
+        snapshot = smtp.capability_snapshot
+        if snapshot is not None:
+            assert snapshot.supports("size")
+            assert snapshot.extensions["size"] == "1000"
+            assert snapshot.auth_methods == ("plain",)
+            assert snapshot.generation > 0
+            assert snapshot.phase in ("cleartext", "tls")
+        smtp.remove_capability_observer(snapshots.append)
