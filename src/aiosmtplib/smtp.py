@@ -34,10 +34,12 @@ from .errors import (
     SMTPRecipientRefused,
     SMTPRecipientsRefused,
     SMTPResponseException,
+    SMTPSendError,
     SMTPSenderRefused,
     SMTPServerDisconnected,
     SMTPTimeoutError,
     SMTPConnectResponseError,
+    SendStage,
 )
 from .esmtp import parse_esmtp_extensions
 from .protocol import SMTPProtocol, normalize_message_line_endings
@@ -193,6 +195,11 @@ class SMTP:
         self.supports_esmtp = False
         self.server_auth_methods: list[str] = []
         self._sendmail_lock: asyncio.Lock | None = None
+        # Snapshot of the protocol flag of the same name, taken when a DATA
+        # command fails, so sendmail can tell an interrupted upload apart
+        # from a missing final acknowledgement even after close() clears
+        # self.protocol.
+        self._data_upload_complete = False
 
         self._validate_config()
 
@@ -964,7 +971,8 @@ class SMTP:
         """
         await self._ehlo_or_helo_if_needed()
 
-        if self.protocol is None:
+        protocol = self.protocol
+        if protocol is None:
             raise SMTPServerDisconnected("Connection lost")
 
         if timeout is Default.token:
@@ -973,12 +981,15 @@ class SMTP:
         if isinstance(message, str):
             message = message.encode("ascii")
 
+        self._data_upload_complete = False
         try:
-            return await self.protocol.execute_data_command(message, timeout=timeout)
+            return await protocol.execute_data_command(message, timeout=timeout)
         except (SMTPServerDisconnected, SMTPTimeoutError):
+            self._data_upload_complete = protocol.data_upload_complete
             self.close()
             raise
         except (SMTPResponseException, asyncio.CancelledError):
+            self._data_upload_complete = protocol.data_upload_complete
             if not self.is_connected:
                 self.close()
             raise
@@ -1406,10 +1417,24 @@ class SMTP:
         send an RSET command to reset the server envelope automatically for
         the next attempt.
 
+        If the connection is lost or a timeout occurs partway through the
+        transaction, :exc:`.SMTPSendError` is raised, chained from the
+        original error. It records the transaction stage reached and the
+        recipients the server had already accepted. If its
+        ``delivery_uncertain`` attribute is true, the message content was
+        fully sent but the server's final acknowledgement was not received,
+        so the message may have been delivered; do not resend it
+        automatically.
+
+        If the send is cancelled, the :exc:`asyncio.CancelledError` is
+        re-raised with a ``send_error`` attribute holding an
+        :exc:`.SMTPSendError` with the same stage and recipient information.
+
         :raises ValueError: on an address that can't be safely sent, or if no
             recipients are given
         :raises SMTPRecipientsRefused: delivery to all recipients failed
         :raises SMTPResponseException: on invalid response
+        :raises SMTPSendError: on connection loss or timeout mid-transaction
         """
         if isinstance(recipients, str):
             recipients = [recipients]
@@ -1459,6 +1484,9 @@ class SMTP:
                 size_option = f"size={message_len}"
                 mail_options.insert(0, size_option)
 
+            stage = SendStage.ENVELOPE
+            accepted_recipients: list[str] = []
+            recipient_errors: dict[str, SMTPResponse] = {}
             try:
                 await self.mail(
                     sender,
@@ -1469,6 +1497,12 @@ class SMTP:
                 recipient_errors = await self._send_recipients(
                     recipients, rcpt_options, encoding=mailbox_encoding, timeout=timeout
                 )
+                accepted_recipients = [
+                    recipient
+                    for recipient in recipients
+                    if recipient not in recipient_errors
+                ]
+                stage = SendStage.CONTENT
                 response = await self.data(message, timeout=timeout)
             except (SMTPResponseException, SMTPRecipientsRefused) as exc:
                 # If we got an error, reset the envelope.
@@ -1479,14 +1513,37 @@ class SMTP:
                     # status, don't raise that as it's confusing
                     pass
                 raise exc
-            except asyncio.CancelledError:
+            except (SMTPServerDisconnected, SMTPTimeoutError) as exc:
+                raise SMTPSendError(
+                    str(exc),
+                    stage=self._effective_send_stage(stage),
+                    accepted_recipients=accepted_recipients,
+                    refused_recipients=recipient_errors,
+                ) from exc
+            except asyncio.CancelledError as exc:
                 # The envelope may be half-open on the server, and a RSET round
                 # trip after a cancellation could block or be cancelled again,
                 # so drop the connection instead.
                 self.close()
+                exc.send_error = SMTPSendError(  # type: ignore[attr-defined]
+                    "Send cancelled",
+                    stage=self._effective_send_stage(stage),
+                    accepted_recipients=accepted_recipients,
+                    refused_recipients=recipient_errors,
+                )
                 raise
 
         return recipient_errors, response.message
+
+    def _effective_send_stage(self, stage: SendStage) -> SendStage:
+        """
+        Upgrade the CONTENT stage to CONFIRMATION if the message content was
+        fully transmitted before the failure, meaning the delivery status is
+        uncertain.
+        """
+        if stage is SendStage.CONTENT and self._data_upload_complete:
+            return SendStage.CONFIRMATION
+        return stage
 
     async def _send_recipients(
         self,
@@ -1553,6 +1610,7 @@ class SMTP:
             on no recipients kwarg or To, Cc or Bcc header in message
         :raises SMTPRecipientsRefused: delivery to all recipients failed
         :raises SMTPResponseException: on invalid response
+        :raises SMTPSendError: on connection loss or timeout mid-transaction
         """
         if mail_options is None:
             mail_options = []

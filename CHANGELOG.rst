@@ -4,6 +4,15 @@ Changelog
 5.1.4 (unreleased)
 ------------------
 
+- Feature: ``sendmail`` now raises ``SMTPSendError`` (chained from the original
+  error) when the connection is lost or a timeout occurs partway through a
+  transaction. The new exception records the transaction stage reached
+  (``SendStage.ENVELOPE``, ``CONTENT`` or ``CONFIRMATION``) and the recipients
+  the server had already accepted, so callers can tell an envelope-stage
+  failure or an interrupted upload apart from an uncertain delivery
+  (``delivery_uncertain``), which should not be resent automatically.
+  Cancellation re-raises ``asyncio.CancelledError`` with the same information
+  available on its ``send_error`` attribute
 - Bugfix: ``SMTPRecipientsRefused`` now exposes the ``message`` attribute shared
   by all ``SMTPException`` subclasses
 - Bugfix: resolve the ``SMTPProtocol`` close waiter on connection loss, so

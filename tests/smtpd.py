@@ -217,6 +217,42 @@ async def mock_response_start_data_stall(
     await asyncio.sleep(10)
 
 
+async def _read_message_data(smtpd: SMTPD) -> None:
+    """
+    Read DATA content up to the terminating <CRLF>.<CRLF>.
+    """
+    while True:
+        line = await smtpd._reader.readuntil(b"\r\n")
+        if line == b".\r\n":
+            break
+
+
+async def mock_response_data_disconnect_after_terminator(
+    smtpd: SMTPD, *args: Any, **kwargs: Any
+) -> None:
+    await smtpd.push("354 End data with <CR><LF>.<CR><LF>")
+    await _read_message_data(smtpd)
+    # Close without the final 250, leaving delivery status unknown.
+    smtpd.transport.close()
+
+
+async def mock_response_data_stall_after_terminator(
+    smtpd: SMTPD, *args: Any, **kwargs: Any
+) -> None:
+    await smtpd.push("354 End data with <CR><LF>.<CR><LF>")
+    await _read_message_data(smtpd)
+    await asyncio.sleep(10)
+
+
+async def mock_response_data_ok_then_disconnect(
+    smtpd: SMTPD, *args: Any, **kwargs: Any
+) -> None:
+    await smtpd.push("354 End data with <CR><LF>.<CR><LF>")
+    await _read_message_data(smtpd)
+    await smtpd.push("250 OK, message accepted for delivery")
+    smtpd.transport.close()
+
+
 async def mock_response_disconnect(smtpd: SMTPD, *args: Any, **kwargs: Any) -> None:
     smtpd.transport.close()
 

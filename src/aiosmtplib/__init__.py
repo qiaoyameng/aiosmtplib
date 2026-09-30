@@ -24,9 +24,11 @@ from .errors import (
     SMTPRecipientRefused,
     SMTPRecipientsRefused,
     SMTPResponseException,
+    SMTPSendError,
     SMTPSenderRefused,
     SMTPServerDisconnected,
     SMTPTimeoutError,
+    SendStage,
 )
 from .response import SMTPResponse
 from .smtp import SMTP
@@ -52,9 +54,11 @@ __all__ = (
     "SMTPRecipientRefused",
     "SMTPRecipientsRefused",
     "SMTPResponseException",
+    "SMTPSendError",
     "SMTPSenderRefused",
     "SMTPServerDisconnected",
     "SMTPTimeoutError",
+    "SendStage",
     "SMTPConnectTimeoutError",
     "SMTPReadTimeoutError",
     "SMTPConnectResponseError",

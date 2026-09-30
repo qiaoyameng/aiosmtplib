@@ -166,6 +166,10 @@ class SMTPProtocol(FlowControlMixin, asyncio.BaseProtocol):
         self._closed_future: "asyncio.Future[None]" = self._loop.create_future()
         self._quit_sent = False
         self._connection_lost_callback = connection_lost_callback
+        # True once the current DATA command's content, including the
+        # terminating <CRLF>.<CRLF>, has been fully written. Used to tell an
+        # interrupted upload apart from a missing final acknowledgement.
+        self._data_upload_complete = False
 
     def _get_close_waiter(self, stream: asyncio.StreamWriter) -> "asyncio.Future[None]":
         return self._closed_future
@@ -176,6 +180,15 @@ class SMTPProtocol(FlowControlMixin, asyncio.BaseProtocol):
         Check if our transport is still connected.
         """
         return bool(self.transport is not None and not self.transport.is_closing())
+
+    @property
+    def data_upload_complete(self) -> bool:
+        """
+        True if the message content of the DATA command in progress (or most
+        recently attempted), including the terminating <CRLF>.<CRLF>, was
+        fully written to the transport.
+        """
+        return self._data_upload_complete
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.transport = cast(asyncio.Transport, transport)
@@ -457,6 +470,7 @@ class SMTPProtocol(FlowControlMixin, asyncio.BaseProtocol):
         message += b".\r\n"
 
         async with self._command_lock:
+            self._data_upload_complete = False
             # Mark a reply as expected before each send (see execute_command).
             self._response_pending = True
             self.write(b"DATA\r\n")
@@ -472,6 +486,7 @@ class SMTPProtocol(FlowControlMixin, asyncio.BaseProtocol):
             for start in range(0, len(view), DATA_CHUNK_SIZE):
                 chunk = bytes(view[start : start + DATA_CHUNK_SIZE])
                 await self._write_and_drain(chunk, timeout)
+            self._data_upload_complete = True
             response = await self._read_response_or_close(timeout=timeout)
             if response.code != SMTPStatus.completed:
                 raise SMTPDataError(response.code, response.message)

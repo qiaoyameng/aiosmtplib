@@ -2,6 +2,7 @@
 SMTP.sendmail and SMTP.send_message method testing.
 """
 
+import asyncio
 import copy
 import email.generator
 import email.header
@@ -12,13 +13,23 @@ import pytest
 
 from aiosmtplib import (
     SMTP,
+    SMTPSendError,
     SMTPNotSupported,
     SMTPRecipientsRefused,
     SMTPResponseException,
+    SMTPServerDisconnected,
+    SMTPReadTimeoutError,
     SMTPStatus,
+    SendStage,
 )
 
 from .smtpd import (
+    RecordingHandler,
+    mock_response_data_disconnect_after_terminator,
+    mock_response_data_ok_then_disconnect,
+    mock_response_data_stall_after_terminator,
+    mock_response_delayed_ok,
+    mock_response_disconnect,
     mock_response_done,
     mock_response_error_disconnect,
     mock_response_bad_command_sequence,
@@ -694,3 +705,177 @@ async def test_sendmail_size_option_not_duplicated(
 
     assert received_commands[1][0] == "MAIL"
     assert received_commands[1][1][1] == ["SIZE=42"]
+
+
+@pytest.mark.smtpd_mocks(smtp_RCPT=mock_response_disconnect)
+async def test_sendmail_disconnect_before_data_records_envelope_stage(
+    smtp_client: SMTP,
+    sender_str: str,
+    recipient_str: str,
+    message_str: str,
+) -> None:
+    async with smtp_client:
+        with pytest.raises(SMTPSendError) as excinfo:
+            await smtp_client.sendmail(sender_str, [recipient_str], message_str)
+
+    error = excinfo.value
+    assert error.stage is SendStage.ENVELOPE
+    assert not error.delivery_uncertain
+    assert error.accepted_recipients == ()
+    assert error.refused_recipients == {}
+    assert isinstance(error.__cause__, SMTPServerDisconnected)
+
+
+@pytest.mark.smtpd_mocks(smtp_DATA=mock_response_disconnect)
+async def test_sendmail_disconnect_on_data_records_content_stage(
+    smtp_client: SMTP,
+    sender_str: str,
+    recipient_str: str,
+    message_str: str,
+) -> None:
+    async with smtp_client:
+        with pytest.raises(SMTPSendError) as excinfo:
+            await smtp_client.sendmail(sender_str, [recipient_str], message_str)
+
+    error = excinfo.value
+    assert error.stage is SendStage.CONTENT
+    assert not error.delivery_uncertain
+    assert error.accepted_recipients == (recipient_str,)
+    assert isinstance(error.__cause__, SMTPServerDisconnected)
+
+
+@pytest.mark.smtpd_mocks(smtp_DATA=mock_response_data_disconnect_after_terminator)
+async def test_sendmail_disconnect_after_terminator_delivery_uncertain(
+    smtp_client: SMTP,
+    sender_str: str,
+    recipient_str: str,
+    message_str: str,
+) -> None:
+    async with smtp_client:
+        with pytest.raises(SMTPSendError) as excinfo:
+            await smtp_client.sendmail(sender_str, [recipient_str], message_str)
+
+    error = excinfo.value
+    assert error.stage is SendStage.CONFIRMATION
+    assert error.delivery_uncertain
+    assert error.accepted_recipients == (recipient_str,)
+    assert isinstance(error.__cause__, SMTPServerDisconnected)
+
+
+@pytest.mark.smtpd_mocks(smtp_DATA=mock_response_data_disconnect_after_terminator)
+async def test_sendmail_disconnect_after_terminator_records_recipients(
+    smtp_client: SMTP,
+    smtpd_handler: RecordingHandler,
+    monkeypatch: pytest.MonkeyPatch,
+    sender_str: str,
+    recipient_str: str,
+    message_str: str,
+) -> None:
+    async def refuse_one_recipient(
+        server: Any,
+        session: Any,
+        envelope: Any,
+        address: str,
+        rcpt_options: Any,
+    ) -> str:
+        if address == "refused@example.com":
+            return "550 no such user"
+        return "250 OK"
+
+    monkeypatch.setattr(smtpd_handler, "handle_RCPT", refuse_one_recipient)
+
+    async with smtp_client:
+        with pytest.raises(SMTPSendError) as excinfo:
+            await smtp_client.sendmail(
+                sender_str, [recipient_str, "refused@example.com"], message_str
+            )
+
+    error = excinfo.value
+    assert error.delivery_uncertain
+    assert error.accepted_recipients == (recipient_str,)
+    refused = error.refused_recipients["refused@example.com"]
+    assert refused.code == SMTPStatus.mailbox_does_not_exist
+
+
+@pytest.mark.smtpd_mocks(smtp_DATA=mock_response_data_stall_after_terminator)
+async def test_sendmail_timeout_after_terminator_delivery_uncertain(
+    smtp_client: SMTP,
+    sender_str: str,
+    recipient_str: str,
+    message_str: str,
+) -> None:
+    async with smtp_client:
+        with pytest.raises(SMTPSendError) as excinfo:
+            await smtp_client.sendmail(
+                sender_str, [recipient_str], message_str, timeout=0.1
+            )
+
+    error = excinfo.value
+    assert error.stage is SendStage.CONFIRMATION
+    assert error.delivery_uncertain
+    assert error.accepted_recipients == (recipient_str,)
+    assert isinstance(error.__cause__, SMTPReadTimeoutError)
+
+
+@pytest.mark.smtpd_mocks(smtp_DATA=mock_response_data_ok_then_disconnect)
+async def test_sendmail_disconnect_after_ok_is_confirmed(
+    smtp_client: SMTP,
+    sender_str: str,
+    recipient_str: str,
+    message_str: str,
+) -> None:
+    async with smtp_client:
+        errors, response = await smtp_client.sendmail(
+            sender_str, [recipient_str], message_str
+        )
+
+    assert errors == {}
+    assert response == "OK, message accepted for delivery"
+
+
+@pytest.mark.smtpd_mocks(smtp_DATA=mock_response_data_stall_after_terminator)
+async def test_sendmail_cancelled_after_terminator_preserves_stage(
+    smtp_client: SMTP,
+    sender_str: str,
+    recipient_str: str,
+    message_str: str,
+) -> None:
+    await smtp_client.connect()
+    send_task = asyncio.create_task(
+        smtp_client.sendmail(sender_str, [recipient_str], message_str)
+    )
+    await asyncio.sleep(0.2)
+    send_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as excinfo:
+        await send_task
+
+    send_error = excinfo.value.send_error
+    assert send_error.stage is SendStage.CONFIRMATION
+    assert send_error.delivery_uncertain
+    assert send_error.accepted_recipients == (recipient_str,)
+    assert not smtp_client.is_connected
+
+
+@pytest.mark.smtpd_mocks(smtp_DATA=mock_response_delayed_ok)
+async def test_sendmail_cancelled_before_data_response_preserves_stage(
+    smtp_client: SMTP,
+    sender_str: str,
+    recipient_str: str,
+    message_str: str,
+) -> None:
+    await smtp_client.connect()
+    send_task = asyncio.create_task(
+        smtp_client.sendmail(sender_str, [recipient_str], message_str)
+    )
+    await asyncio.sleep(0.2)
+    send_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as excinfo:
+        await send_task
+
+    send_error = excinfo.value.send_error
+    assert send_error.stage is SendStage.CONTENT
+    assert not send_error.delivery_uncertain
+    assert send_error.accepted_recipients == (recipient_str,)
+    assert not smtp_client.is_connected

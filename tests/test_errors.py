@@ -19,10 +19,13 @@ from aiosmtplib import (
     SMTPReadTimeoutError,
     SMTPRecipientRefused,
     SMTPRecipientsRefused,
+    SMTPResponse,
     SMTPResponseException,
+    SMTPSendError,
     SMTPSenderRefused,
     SMTPServerDisconnected,
     SMTPTimeoutError,
+    SendStage,
 )
 
 
@@ -146,3 +149,40 @@ def test_raise_smtp_not_supported(error_message: str) -> None:
 
     assert issubclass(excinfo.type, SMTPException)
     assert excinfo.value.message == error_message
+
+
+@given(error_message=text())
+def test_smtp_send_error_defaults(error_message: str) -> None:
+    error = SMTPSendError(error_message, stage=SendStage.ENVELOPE)
+
+    assert issubclass(SMTPSendError, SMTPException)
+    assert error.message == error_message
+    assert error.stage is SendStage.ENVELOPE
+    assert error.accepted_recipients == ()
+    assert error.refused_recipients == {}
+    assert not error.delivery_uncertain
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected_uncertain"),
+    [
+        (SendStage.ENVELOPE, False),
+        (SendStage.CONTENT, False),
+        (SendStage.CONFIRMATION, True),
+    ],
+)
+def test_smtp_send_error_delivery_uncertain(
+    stage: SendStage, expected_uncertain: bool
+) -> None:
+    error = SMTPSendError(
+        "Connection lost",
+        stage=stage,
+        accepted_recipients=["one@example.com"],
+        refused_recipients={"two@example.com": SMTPResponse(550, "no such user")},
+    )
+
+    assert error.delivery_uncertain is expected_uncertain
+    assert error.accepted_recipients == ("one@example.com",)
+    assert error.refused_recipients == {
+        "two@example.com": SMTPResponse(550, "no such user")
+    }
