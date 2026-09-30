@@ -153,6 +153,38 @@ alternatives.
     asyncio.run(send_multipart_message(message))
 
 
+Internationalized Messages (SMTPUTF8)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Before sending, :meth:`SMTP.send_message` analyses the envelope and the
+serialized headers and body (see :meth:`SMTP.prepare_message` and
+:func:`aiosmtplib.email.plan_message`):
+
+* Non-ASCII display names (e.g. ``张伟 <zhang.wei@example.com>``) and other
+  header text are folded into MIME encoded-words, so they never require
+  SMTPUTF8 on their own.
+* Internationalized domain names (e.g. ``user@例え.jp``) are sent as U-labels
+  when the server advertises SMTPUTF8, and downgraded to IDNA A-labels
+  (``user@xn--r8jz45g.jp``) in both the envelope and the headers when it does
+  not.
+* A non-ASCII local part (e.g. ``张伟@example.com``) can only be carried with
+  SMTPUTF8. It is never silently transliterated; if the server doesn't
+  advertise the extension, :class:`aiosmtplib.SMTPNotSupported` is raised
+  before any ``MAIL`` command is issued.
+* 8-bit message bodies use ``BODY=8BITMIME`` when available, and are otherwise
+  downgraded to a 7-bit content transfer encoding automatically.
+
+To inspect the decision without sending, call :meth:`SMTP.prepare_message`
+(after connecting) or :func:`aiosmtplib.email.plan_message` (no connection
+needed)::
+
+    from aiosmtplib.email import plan_message
+
+    plan = plan_message(message)
+    if plan.utf8_required and not smtp_client.supports_extension("smtputf8"):
+        ...  # the message can't be delivered as-is to this server
+
+
 :meth:`SMTP.sendmail`
 ~~~~~~~~~~~~~~~~~~~~~
 

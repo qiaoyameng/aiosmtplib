@@ -18,10 +18,10 @@ from .auth import (
     auth_xoauth2_encode,
 )
 from .email import (
-    extract_recipients,
-    extract_sender,
+    MessageSendPlan,
     flatten_message,
     parse_address,
+    plan_message,
     quote_address,
 )
 from .errors import (
@@ -1518,6 +1518,86 @@ class SMTP:
 
         return formatted_errors
 
+    async def prepare_message(
+        self,
+        message: email.message.EmailMessage | email.message.Message,
+        /,
+        *,
+        sender: str | None = None,
+        recipients: str | Sequence[str] | None = None,
+        mail_options: Iterable[str] | None = None,
+        timeout: float | Literal[Default.token] | None = Default.token,
+    ) -> tuple[MessageSendPlan, list[str], bytes]:
+        """
+        Work out how a message will be sent, without opening a mail transaction.
+
+        The envelope and message are analysed with :func:`plan_message` (the
+        same rules used by :meth:`send_message`), EHLO is run so that the
+        server's SMTPUTF8/8BITMIME capabilities can be taken into account, and
+        the resulting mail options and serialized message bytes are returned.
+
+        :raises SMTPNotSupported: if the message requires SMTPUTF8 (e.g. a
+            non-ASCII local part that can't be downgraded) but the server
+            doesn't advertise it. The failure happens before any MAIL command.
+        """
+        plan = plan_message(message, sender=sender, recipients=recipients)
+
+        if mail_options is None:
+            options: list[str] = []
+        else:
+            options = list(mail_options)
+
+        # Make sure we've done an EHLO for extension checks
+        await self._ehlo_or_helo_if_needed()
+
+        smtputf8_requested = any(
+            option.lower() == "smtputf8" for option in options
+        )
+        # SMTPUTF8 is mandatory for un-downgradeable addresses. For IDN
+        # domains it's preferred (send the U-label) but a server without it
+        # gets an A-label downgrade instead.
+        use_smtputf8 = plan.utf8_required or smtputf8_requested
+        if not use_smtputf8 and plan.idn_addresses:
+            use_smtputf8 = self.supports_extension("smtputf8")
+
+        if plan.utf8_required or smtputf8_requested:
+            if not self.supports_extension("smtputf8"):
+                if plan.addresses_requiring_utf8:
+                    addresses = ", ".join(sorted(plan.addresses_requiring_utf8))
+                    detail = (
+                        f"addresses with non-ASCII local parts ({addresses}) require "
+                        "SMTPUTF8"
+                    )
+                else:
+                    detail = "the message headers can't be downgraded to ASCII"
+                raise SMTPNotSupported(
+                    f"{detail}, but SMTPUTF8 is not supported by this server"
+                )
+        if use_smtputf8 and not smtputf8_requested:
+            options.append("SMTPUTF8")
+
+        if self.supports_extension("8BITMIME"):
+            if not any(option.lower() == "body=8bitmime" for option in options):
+                options.append("BODY=8BITMIME")
+            cte_type = "8bit"
+        else:
+            cte_type = "7bit"
+
+        # Without SMTPUTF8 every IDN address in envelope or headers is sent
+        # as an A-label, so the serialized headers stay in sync with MAIL/RCPT.
+        ascii_addresses: dict[str, str] | None = (
+            dict(plan.ascii_address_map) if not use_smtputf8 else None
+        )
+
+        flat_message = flatten_message(
+            message,
+            utf8=use_smtputf8,
+            cte_type=cte_type,
+            ascii_addresses=ascii_addresses,
+        )
+
+        return plan, options, flat_message
+
     async def send_message(
         self,
         message: email.message.EmailMessage | email.message.Message,
@@ -1532,14 +1612,14 @@ class SMTP:
         r"""
         Sends an :py:class:`email.message.EmailMessage` object.
 
-        Arguments are as for :meth:`.sendmail`, except that message is an
-        :py:class:`email.message.EmailMessage` object.  If sender is None or
-        recipients is None, these arguments are taken from the headers of the
-        EmailMessage as described in RFC 2822.  Regardless of the values of sender
-        and recipients, any Bcc field (or Resent-Bcc field, when the message is a
-        resent) of the EmailMessage object will not be transmitted.  The EmailMessage
-        object is then serialized using :py:class:`email.generator.Generator` and
-        :meth:`.sendmail` is called to transmit the message.
+        Before any SMTP command is issued, the message envelope (sender and
+        recipients) and serialized headers/body are analysed with
+        :func:`plan_message`: see that function and
+        :meth:`prepare_message` for the SMTPUTF8/8BITMIME and downgrade rules.
+        In particular, a non-ASCII local part requires SMTPUTF8 and is never
+        silently transliterated; :class:`SMTPNotSupported` is raised before
+        MAIL if the server doesn't advertise the extension. A non-ASCII display
+        name or internationalized domain name alone does not require it.
 
         'Resent-Date' is a mandatory field if the message is resent (RFC 2822
         Section 3.6.6). In such a case, we use the 'Resent-\*' fields.
@@ -1551,60 +1631,26 @@ class SMTP:
             on more than one Resent header block
             on no sender kwarg or From header in message
             on no recipients kwarg or To, Cc or Bcc header in message
+        :raises SMTPNotSupported: when SMTPUTF8 is required but unavailable
         :raises SMTPRecipientsRefused: delivery to all recipients failed
         :raises SMTPResponseException: on invalid response
         """
-        if mail_options is None:
-            mail_options = []
-        else:
-            mail_options = list(mail_options)
+        plan, options, flat_message = await self.prepare_message(
+            message,
+            sender=sender,
+            recipients=recipients,
+            mail_options=mail_options,
+            timeout=timeout,
+        )
 
-        if sender is None:
-            sender = extract_sender(message)
-        if sender is None:
-            raise ValueError("No From header provided in message")
-
-        if isinstance(recipients, str):
-            recipients = [recipients]
-        elif recipients is None:
-            recipients = extract_recipients(message)
-        if not recipients:
-            raise ValueError("No recipient headers provided in message")
-
-        # Make sure we've done an EHLO for extension checks
-        await self._ehlo_or_helo_if_needed()
-
-        try:
-            sender.encode("ascii")
-            "".join(recipients).encode("ascii")
-        except UnicodeEncodeError:
-            utf8_required = True
-        else:
-            utf8_required = False
-
-        if utf8_required:
-            if not self.supports_extension("smtputf8"):
-                raise SMTPNotSupported(
-                    "An address containing non-ASCII characters was provided, but "
-                    "SMTPUTF8 is not supported by this server"
-                )
-            elif "smtputf8" not in [option.lower() for option in mail_options]:
-                mail_options.append("SMTPUTF8")
-
-        if self.supports_extension("8BITMIME"):
-            if "body=8bitmime" not in [option.lower() for option in mail_options]:
-                mail_options.append("BODY=8BITMIME")
-            cte_type = "8bit"
-        else:
-            cte_type = "7bit"
-
-        flat_message = flatten_message(message, utf8=utf8_required, cte_type=cte_type)
+        smtputf8 = any(option.lower() == "smtputf8" for option in options)
+        envelope_sender, envelope_recipients = plan.envelope(smtputf8=smtputf8)
 
         return await self.sendmail(
-            sender,
-            recipients,
+            envelope_sender,
+            envelope_recipients,
             flat_message,
-            mail_options=mail_options,
+            mail_options=options,
             rcpt_options=rcpt_options,
             timeout=timeout,
         )

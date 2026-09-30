@@ -6,6 +6,7 @@ import socket
 import ssl
 
 import aiosmtplib
+from aiosmtplib.email import MessageSendPlan, plan_message
 
 
 async def send_str() -> None:
@@ -47,3 +48,13 @@ async def send_message_async_context_manager() -> None:
     message = email.message.EmailMessage()
     async with aiosmtplib.SMTP(hostname="smtp.example.com") as smtp:
         await smtp.send_message(message)
+
+
+async def plan_and_prepare_message() -> None:
+    message = email.message.EmailMessage()
+    plan: MessageSendPlan = plan_message(message)
+    requiring_utf8: frozenset[str] = plan.addresses_requiring_utf8
+    async with aiosmtplib.SMTP(hostname="smtp.example.com") as smtp:
+        planned, mail_options, flat_message = await smtp.prepare_message(message)
+        sender, recipients = planned.envelope(smtputf8=True)
+        await smtp.sendmail(sender, recipients, flat_message, mail_options=mail_options)

@@ -4,6 +4,14 @@ Changelog
 5.1.4 (unreleased)
 ------------------
 
+- Feature: ``send_message`` now plans SMTPUTF8/8BITMIME requirements from the
+  actual envelope, IDNA domains and serialized headers before sending (see the
+  new ``SMTP.prepare_message`` coroutine and ``aiosmtplib.email.plan_message``,
+  which share the exact rules used for transmission). Non-ASCII display names
+  no longer imply SMTPUTF8; internationalized domains downgrade to IDNA
+  A-labels when the server lacks SMTPUTF8; non-ASCII local parts raise
+  ``SMTPNotSupported`` before ``MAIL`` instead of being silently mangled; and
+  8-bit bodies downgrade to a 7-bit CTE when 8BITMIME is unavailable
 - Bugfix: ``SMTPRecipientsRefused`` now exposes the ``message`` attribute shared
   by all ``SMTPException`` subclasses
 - Bugfix: resolve the ``SMTPProtocol`` close waiter on connection loss, so
