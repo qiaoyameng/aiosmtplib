@@ -101,6 +101,18 @@ class SMTPAuthenticationError(SMTPResponseException):
     Server refused our AUTH request; may be caused by invalid credentials.
     """
 
+    def __init__(
+        self,
+        code: int,
+        message: str,
+        /,
+        xoauth2_error: str | None = None,
+    ) -> None:
+        super().__init__(code, message)
+        # The parsed XOAUTH2 error challenge status (e.g. "401"), when the
+        # failed exchange used XOAUTH2. Never contains the access token.
+        self.xoauth2_error = xoauth2_error
+
 
 class SMTPSenderRefused(SMTPResponseException):
     """

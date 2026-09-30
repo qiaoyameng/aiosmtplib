@@ -4,6 +4,7 @@ Tests for authentication encoding utils.
 
 import base64
 import hmac
+import json
 
 import pytest
 from hypothesis import given
@@ -14,6 +15,8 @@ from aiosmtplib.auth import (
     auth_login_encode,
     auth_plain_encode,
     auth_xoauth2_encode,
+    is_xoauth2_refreshable,
+    parse_xoauth2_challenge,
 )
 from aiosmtplib.errors import SMTPAuthenticationError
 from aiosmtplib.typing import SMTPStatus
@@ -155,3 +158,64 @@ def test_auth_xoauth2_encode_known_value() -> None:
         b"user=someuser@example.com\x01"
         b"auth=Bearer ya29.vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg\x01\x01"
     )
+
+
+@pytest.mark.parametrize(
+    ("status", "extra"),
+    [
+        ("401", {}),
+        ("403", {}),
+        ("400", {"schemes": "Bearer"}),
+        ("invalid_token", {"scope": "https://mail.google.com/"}),
+    ],
+)
+def test_parse_xoauth2_challenge_valid(status: str, extra: dict) -> None:
+    payload = {"status": status, **extra}
+    challenge = base64.b64encode(json.dumps(payload).encode())
+    assert parse_xoauth2_challenge(challenge) == status
+
+
+def test_parse_xoauth2_challenge_accepts_str() -> None:
+    encoded = base64.b64encode(b'{"status": "401"}').decode("ascii")
+    assert parse_xoauth2_challenge(encoded) == "401"
+
+
+@pytest.mark.parametrize(
+    "challenge",
+    [
+        "",
+        "not base64!",
+        base64.b64encode(b"not json"),
+        base64.b64encode(b"["),
+        base64.b64encode(b'"a string"'),
+        base64.b64encode(b"[1, 2]"),
+        base64.b64encode(b'{"other": "field"}'),
+        base64.b64encode(b'{"status": 401}'),
+        base64.b64encode(b'{"status": ""}'),
+        b"\x01\x02",
+    ],
+)
+def test_parse_xoauth2_challenge_invalid_returns_none(
+    challenge: str | bytes,
+) -> None:
+    assert parse_xoauth2_challenge(challenge) is None
+
+
+def test_is_xoauth2_refreshable() -> None:
+    refreshable = SMTPAuthenticationError(
+        SMTPStatus.auth_failed, "bad", xoauth2_error="401"
+    )
+    assert is_xoauth2_refreshable(refreshable)
+
+    wrong_scope = SMTPAuthenticationError(
+        SMTPStatus.auth_failed, "bad", xoauth2_error="403"
+    )
+    assert not is_xoauth2_refreshable(wrong_scope)
+
+    bare_failure = SMTPAuthenticationError(SMTPStatus.auth_failed, "bad")
+    assert not is_xoauth2_refreshable(bare_failure)
+
+    wrong_code = SMTPAuthenticationError(
+        SMTPStatus.error_processing, "bad", xoauth2_error="401"
+    )
+    assert not is_xoauth2_refreshable(wrong_code)

@@ -45,12 +45,34 @@ as ``oauth_token_generator`` is responsible for returning a valid, non-expired
 token each time it is called. It will be called immediately before the
 ``XOAUTH2`` authentication command is sent to the server.
 
-**Your generator must handle expiry**
+**One automatic refresh on an expired token**
 
-aiosmtplib does not track token expiry times or automatically retry on
-authentication failure. Your callable should check if the token is expired
-and refresh it before returning. Some libraries (e.g. ``google-auth``,
-documented below) will handle this.
+If the server rejects the token with an explicit ``401`` invalid-grant XOAUTH2
+challenge, aiosmtplib finishes the failed SASL exchange (sending the empty
+challenge response and reading the final reply), awaits the callable exactly
+once more to obtain a fresh token, and retries the exchange once. If the
+second attempt also fails, the error is propagated.
+
+A refresh is *not* attempted for failures that a new token cannot fix:
+
+- a ``403`` challenge (the token is valid but lacks the required scope),
+- a bare ``535`` reply with no XOAUTH2 error challenge,
+- transient service failures such as ``421`` or ``451``,
+- a lost connection or a malformed/protocol-level reply.
+
+If the callable itself raises while fetching the replacement token, that
+exception is propagated and no further authentication is attempted.
+Cancelling the authentication never triggers a hidden second login.
+
+The same flow is available directly via :meth:`SMTP.login_xoauth2`. The
+parsed challenge status (e.g. ``"401"`` or ``"403"``) is exposed as
+``SMTPAuthenticationError.xoauth2_error``; it contains only the status code,
+never the access token.
+
+Your callable should still return a currently valid token; the automatic
+refresh exists to cover a token that expires between when it was issued and
+when authentication runs. Libraries such as ``google-auth`` and ``msal``
+(documented below) handle caching and refresh internally.
 
 
 Gmail Example

@@ -4,6 +4,15 @@ Changelog
 5.1.4 (unreleased)
 ------------------
 
+- Feature: XOAUTH2 authentication now performs a single automatic credential
+  refresh when using ``oauth_token_generator``: if the server completes the
+  SASL exchange with an explicit ``401`` invalid-token challenge, the token
+  generator is awaited once more and the exchange retried once. Insufficient
+  scope (``403``), bare ``535`` failures, transient service errors, and
+  protocol errors are propagated without a second token fetch. The new
+  :meth:`SMTP.login_xoauth2` exposes this flow directly, and
+  ``SMTPAuthenticationError`` carries the parsed ``xoauth2_error`` challenge
+  status (which never contains the access token)
 - Bugfix: ``SMTPRecipientsRefused`` now exposes the ``message`` attribute shared
   by all ``SMTPException`` subclasses
 - Bugfix: resolve the ``SMTPProtocol`` close waiter on connection loss, so

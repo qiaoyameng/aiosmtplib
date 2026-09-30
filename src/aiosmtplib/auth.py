@@ -5,6 +5,7 @@ Authentication related methods.
 import base64
 import binascii
 import hmac
+import json
 
 from .errors import SMTPAuthenticationError
 from .typing import SMTPStatus
@@ -14,7 +15,14 @@ __all__ = (
     "auth_login_encode",
     "auth_plain_encode",
     "auth_xoauth2_encode",
+    "parse_xoauth2_challenge",
+    "is_xoauth2_refreshable",
 )
+
+# XOAUTH2 error challenge statuses, per
+# https://developers.google.com/gmail/imap/xoauth2-protocol#error_response_2
+XOAUTH2_INVALID_TOKEN = "401"
+XOAUTH2_INVALID_SCOPE = "403"
 
 
 def _ensure_bytes(value: str | bytes) -> bytes:
@@ -106,3 +114,52 @@ def auth_xoauth2_encode(
     encoded = base64.b64encode(auth_string)
 
     return encoded
+
+
+def parse_xoauth2_challenge(challenge: str | bytes, /) -> str | None:
+    """
+    Decode a base64-encoded XOAUTH2 error challenge and return its ``status``
+    value (e.g. ``"401"`` for an expired token, ``"403"`` for insufficient
+    scope).
+
+    Returns ``None`` if the challenge is empty, not valid base64, or not a JSON
+    object carrying a string status. Protocol-level junk is therefore not
+    mistaken for a refreshable credential failure.
+    """
+    if isinstance(challenge, str):
+        challenge = challenge.encode("ascii", errors="ignore")
+
+    if not challenge:
+        return None
+
+    try:
+        decoded = base64.b64decode(challenge, validate=True)
+        payload = json.loads(decoded)
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    status = payload.get("status")
+    if not isinstance(status, str) or not status:
+        return None
+
+    return status
+
+
+def is_xoauth2_refreshable(exc: SMTPAuthenticationError, /) -> bool:
+    """
+    Whether an XOAUTH2 authentication failure indicates credentials that can
+    be refreshed (a fresh access token may succeed).
+
+    Only an explicit ``401`` invalid-grant challenge that completed the SASL
+    exchange (the failure surfaced on the final reply) qualifies. A ``403``
+    (insufficient scope), a bare ``535`` with no challenge, and protocol or
+    transient service errors are deliberately excluded: retrying those with a
+    new token cannot help.
+    """
+    return (
+        exc.code == SMTPStatus.auth_failed
+        and exc.xoauth2_error == XOAUTH2_INVALID_TOKEN
+    )

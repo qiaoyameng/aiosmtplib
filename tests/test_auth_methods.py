@@ -14,7 +14,11 @@ from aiosmtplib.auth import (
     auth_plain_encode,
     auth_xoauth2_encode,
 )
-from aiosmtplib.errors import SMTPAuthenticationError, SMTPException
+from aiosmtplib.errors import (
+    SMTPAuthenticationError,
+    SMTPException,
+    SMTPNotSupported,
+)
 from aiosmtplib.response import SMTPResponse
 from aiosmtplib.typing import SMTPStatus
 
@@ -266,6 +270,163 @@ async def test_maybe_login_with_oauth_token_generator(mock_auth: DummySMTPAuth) 
 
     encoded = auth_xoauth2_encode("user@example.com", "test_oauth_token")
     assert mock_auth.received_commands == [b"AUTH XOAUTH2 " + encoded]
+
+
+async def test_maybe_login_oauth_requires_username(mock_auth: DummySMTPAuth) -> None:
+    """Missing username raises before the token generator is awaited."""
+    mock_auth.server_auth_methods = ["xoauth2"]
+    mock_auth._login_username = None
+
+    async def get_token() -> str:
+        raise AssertionError("generator must not be called")
+
+    mock_auth._oauth_token_generator = get_token
+
+    with pytest.raises(SMTPException, match="username is required"):
+        await mock_auth._maybe_login_on_connect()
+
+
+async def test_maybe_login_oauth_requires_xoauth2_support(
+    mock_auth: DummySMTPAuth,
+) -> None:
+    """A server that does not advertise XOAUTH2 fails without fetching."""
+    mock_auth.server_auth_methods = ["plain"]
+    mock_auth._login_username = "user@example.com"
+
+    async def get_token() -> str:
+        raise AssertionError("generator must not be called")
+
+    mock_auth._oauth_token_generator = get_token
+
+    with pytest.raises(SMTPException, match="does not support XOAUTH2"):
+        await mock_auth._maybe_login_on_connect()
+
+
+def _challenge(status: str) -> tuple[int, str]:
+    return (
+        SMTPStatus.auth_continue,
+        base64.b64encode(f'{{"status": "{status}"}}'.encode()).decode("ascii"),
+    )
+
+
+async def test_login_xoauth2_success_uses_provider_once(
+    mock_auth: DummySMTPAuth,
+) -> None:
+    mock_auth.server_auth_methods = ["xoauth2"]
+    mock_auth.responses.append(SUCCESS_RESPONSE)
+    calls = []
+
+    async def get_token() -> str:
+        calls.append("good-token")
+        return "good-token"
+
+    response = await mock_auth.login_xoauth2("user@example.com", get_token)
+
+    assert response.code == SMTPStatus.auth_successful
+    assert calls == ["good-token"]
+    encoded = auth_xoauth2_encode("user@example.com", "good-token")
+    assert mock_auth.received_commands == [b"AUTH XOAUTH2 " + encoded]
+
+
+async def test_login_xoauth2_refreshes_once_on_401(
+    mock_auth: DummySMTPAuth,
+) -> None:
+    mock_auth.server_auth_methods = ["xoauth2"]
+    # First exchange: 334 challenge, empty line, 535 final.
+    mock_auth.responses.extend(
+        [
+            _challenge("401"),
+            FAILURE_RESPONSE,
+            SUCCESS_RESPONSE,
+        ]
+    )
+    tokens = iter(["expired-token", "fresh-token"])
+    calls = []
+
+    async def get_token() -> str:
+        token = next(tokens)
+        calls.append(token)
+        return token
+
+    await mock_auth.login_xoauth2("user@example.com", get_token)
+
+    assert calls == ["expired-token", "fresh-token"]
+    assert mock_auth.received_commands == [
+        b"AUTH XOAUTH2 " + auth_xoauth2_encode("user@example.com", "expired-token"),
+        b"",
+        b"AUTH XOAUTH2 " + auth_xoauth2_encode("user@example.com", "fresh-token"),
+    ]
+
+
+async def test_login_xoauth2_403_no_refresh(mock_auth: DummySMTPAuth) -> None:
+    mock_auth.server_auth_methods = ["xoauth2"]
+    mock_auth.responses.extend([_challenge("403"), FAILURE_RESPONSE])
+    calls = []
+
+    async def get_token() -> str:
+        calls.append("scoped-token")
+        return "scoped-token"
+
+    with pytest.raises(SMTPAuthenticationError) as excinfo:
+        await mock_auth.login_xoauth2("user@example.com", get_token)
+
+    assert excinfo.value.xoauth2_error == "403"
+    assert calls == ["scoped-token"]
+    assert mock_auth.received_commands == [
+        b"AUTH XOAUTH2 "
+        + auth_xoauth2_encode("user@example.com", "scoped-token"),
+        b"",
+    ]
+
+
+async def test_login_xoauth2_bare_failure_no_refresh(
+    mock_auth: DummySMTPAuth,
+) -> None:
+    mock_auth.server_auth_methods = ["xoauth2"]
+    mock_auth.responses.append(FAILURE_RESPONSE)
+    calls = []
+
+    async def get_token() -> str:
+        calls.append("some-token")
+        return "some-token"
+
+    with pytest.raises(SMTPAuthenticationError):
+        await mock_auth.login_xoauth2("user@example.com", get_token)
+
+    assert calls == ["some-token"]
+
+
+async def test_login_xoauth2_provider_error_on_refresh_propagates(
+    mock_auth: DummySMTPAuth,
+) -> None:
+    mock_auth.server_auth_methods = ["xoauth2"]
+    mock_auth.responses.extend([_challenge("401"), FAILURE_RESPONSE])
+    calls = []
+
+    async def get_token() -> str:
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("token endpoint down")
+        return "expired-token"
+
+    with pytest.raises(RuntimeError, match="token endpoint down"):
+        await mock_auth.login_xoauth2("user@example.com", get_token)
+
+    assert calls == [1, 1]
+    assert mock_auth.received_commands == [
+        b"AUTH XOAUTH2 " + auth_xoauth2_encode("user@example.com", "expired-token"),
+        b"",
+    ]
+
+
+async def test_login_xoauth2_unsupported_method(mock_auth: DummySMTPAuth) -> None:
+    mock_auth.server_auth_methods = ["plain"]
+
+    async def get_token() -> str:
+        raise AssertionError("provider must not be called")
+
+    with pytest.raises(SMTPNotSupported, match="XOAUTH2"):
+        await mock_auth.login_xoauth2("user@example.com", get_token)
 
 
 async def test_auth_crammd5_passes_timeout(mock_auth: DummySMTPAuth) -> None:

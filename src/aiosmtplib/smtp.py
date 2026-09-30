@@ -16,6 +16,8 @@ from .auth import (
     auth_login_encode,
     auth_plain_encode,
     auth_xoauth2_encode,
+    is_xoauth2_refreshable,
+    parse_xoauth2_challenge,
 )
 from .email import (
     extract_recipients,
@@ -587,8 +589,9 @@ class SMTP:
                 raise SMTPException(
                     "oauth_token_generator provided but server does not support XOAUTH2"
                 )
-            token = await self._oauth_token_generator()
-            await self.auth_xoauth2(self._login_username, token)
+            await self.login_xoauth2(
+                self._login_username, self._oauth_token_generator
+            )
         elif self._login_username is not None:
             login_password = (
                 self._login_password if self._login_password is not None else ""
@@ -1327,14 +1330,60 @@ class SMTP:
             b"AUTH", b"XOAUTH2", encoded, timeout=timeout
         )
 
+        xoauth2_error: str | None = None
         if response.code == SMTPStatus.auth_continue:
-            # Server sent an error challenge; send empty response to get final error
+            # Server sent an error challenge. Parse it, then send an empty
+            # response to complete the SASL exchange and obtain the final
+            # result; only that final reply decides success or failure.
+            xoauth2_error = parse_xoauth2_challenge(response.message)
             response = await self.execute_command(b"", timeout=timeout)
 
         if response.code != SMTPStatus.auth_successful:
-            raise SMTPAuthenticationError(response.code, response.message)
+            raise SMTPAuthenticationError(
+                response.code, response.message, xoauth2_error=xoauth2_error
+            )
 
         return response
+
+    async def login_xoauth2(
+        self,
+        username: str | bytes,
+        token_generator: SMTPTokenGenerator,
+        /,
+        *,
+        timeout: float | Literal[Default.token] | None = Default.token,
+    ) -> SMTPResponse:
+        """
+        Authenticate via XOAUTH2 using a short-lived access token supplied by
+        an async ``token_generator`` callable.
+
+        The generator is awaited immediately before the ``AUTH XOAUTH2`` command.
+        If the server completes the exchange with an explicit ``401``
+        invalid-token challenge, the credentials may have expired, so the
+        generator is awaited exactly once more and the SASL exchange is
+        retried once. Failures caused by insufficient scope (``403``), a bare
+        ``535`` reply, transient service errors, disconnects, or protocol
+        errors are propagated without another token fetch.
+        """
+        await self._ehlo_or_helo_if_needed()
+        if "xoauth2" not in self.server_auth_methods:
+            raise SMTPNotSupported(
+                "Server does not support the XOAUTH2 authentication method"
+            )
+
+        token = await token_generator()
+        try:
+            return await self.auth_xoauth2(username, token, timeout=timeout)
+        except SMTPAuthenticationError as exc:
+            if not is_xoauth2_refreshable(exc):
+                raise
+
+            # The failed exchange is fully terminated (empty-line response
+            # sent and final reply read). Fetch one fresh token and retry the
+            # whole exchange once. CancelledError is intentionally not caught,
+            # so cancellation can never trigger a hidden re-login.
+            token = await token_generator()
+            return await self.auth_xoauth2(username, token, timeout=timeout)
 
     async def sendmail(
         self,
