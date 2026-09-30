@@ -11,6 +11,7 @@ Author: Cole Maclean <hi@colemaclean.dev>
 """
 
 from .api import send
+from .capabilities import CapabilitySnapshot
 from .errors import (
     SMTPAuthenticationError,
     SMTPConnectError,
@@ -39,6 +40,7 @@ __license__ = "MIT"
 __copyright__ = "Copyright 2022 Cole Maclean"
 __all__ = (
     "send",
+    "CapabilitySnapshot",
     "SMTP",
     "SMTPResponse",
     "SMTPStatus",

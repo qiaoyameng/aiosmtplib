@@ -17,6 +17,12 @@ from .auth import (
     auth_plain_encode,
     auth_xoauth2_encode,
 )
+from .capabilities import (
+    CapabilitiesObserver,
+    CapabilityPhase,
+    CapabilitySnapshot,
+    ExtensionSelector,
+)
 from .email import (
     extract_recipients,
     extract_sender,
@@ -193,6 +199,10 @@ class SMTP:
         self.supports_esmtp = False
         self.server_auth_methods: list[str] = []
         self._sendmail_lock: asyncio.Lock | None = None
+        self._capabilities: CapabilitySnapshot | None = None
+        self._capabilities_observers: list[CapabilitiesObserver] = []
+        self._extension_selectors: list[ExtensionSelector] = []
+        self._connection_generation = 0
 
         self._validate_config()
 
@@ -241,6 +251,7 @@ class SMTP:
         self.esmtp_extensions = extensions
         self.server_auth_methods = auth_methods
         self.supports_esmtp = True
+        self._publish_capabilities()
 
     @property
     def is_ehlo_or_helo_needed(self) -> bool:
@@ -255,6 +266,68 @@ class SMTP:
         Get all AUTH methods supported by the both server and by us.
         """
         return [auth for auth in self.AUTH_METHODS if auth in self.server_auth_methods]
+
+    @property
+    def capabilities(self) -> CapabilitySnapshot | None:
+        """
+        The capabilities negotiated with the server, as an immutable snapshot,
+        or ``None`` if no EHLO has completed for the current connection phase.
+        """
+        return self._capabilities
+
+    def add_capabilities_observer(self, observer: CapabilitiesObserver) -> None:
+        """
+        Register a callback to be notified when the capability snapshot
+        changes. The callback receives the new snapshot, or ``None`` when the
+        current capabilities are invalidated (STARTTLS upgrade, disconnect).
+        """
+        if observer not in self._capabilities_observers:
+            self._capabilities_observers.append(observer)
+
+    def remove_capabilities_observer(self, observer: CapabilitiesObserver) -> None:
+        """
+        Remove a callback registered with :meth:`add_capabilities_observer`.
+        """
+        self._capabilities_observers.remove(observer)
+
+    def add_extension_selector(self, selector: ExtensionSelector) -> None:
+        """
+        Register a callback that returns extra MAIL command options based on
+        the current capability snapshot (or ``None``). Selectors are called
+        on every MAIL command, after any EHLO/HELO negotiation.
+        """
+        if selector not in self._extension_selectors:
+            self._extension_selectors.append(selector)
+
+    def remove_extension_selector(self, selector: ExtensionSelector) -> None:
+        """
+        Remove a callback registered with :meth:`add_extension_selector`.
+        """
+        self._extension_selectors.remove(selector)
+
+    def _publish_capabilities(self) -> None:
+        phase: CapabilityPhase = (
+            "tls"
+            if self.transport is not None
+            and self.transport.get_extra_info("sslcontext") is not None
+            else "cleartext"
+        )
+        self._set_capabilities(
+            CapabilitySnapshot(
+                generation=self._connection_generation,
+                phase=phase,
+                extensions=self.esmtp_extensions,
+                auth_methods=tuple(self.server_auth_methods),
+                supports_esmtp=self.supports_esmtp,
+            )
+        )
+
+    def _set_capabilities(self, snapshot: CapabilitySnapshot | None) -> None:
+        if snapshot is self._capabilities:
+            return
+        self._capabilities = snapshot
+        for observer in self._capabilities_observers:
+            observer(snapshot)
 
     def _update_settings_from_kwargs(
         self,
@@ -462,6 +535,7 @@ class SMTP:
 
         # The lock is held until close(), serializing concurrent connect calls.
         await self._connect_lock.acquire()
+        self._connection_generation += 1
 
         try:
             if self.local_hostname is None:
@@ -900,6 +974,11 @@ class SMTP:
 
         if options is None:
             options = []
+        else:
+            options = list(options)
+
+        for selector in self._extension_selectors:
+            options.extend(selector(self._capabilities))
 
         quoted_sender = quote_address(sender)
         addr_bytes = quoted_sender.encode(encoding)
@@ -1049,6 +1128,7 @@ class SMTP:
         self.esmtp_extensions = {}
         self.supports_esmtp = False
         self.server_auth_methods = []
+        self._set_capabilities(None)
 
     async def starttls(
         self,

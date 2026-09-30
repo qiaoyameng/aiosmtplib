@@ -27,6 +27,13 @@ The lower level :class:`aiosmtplib.SMTP` class gives you more control over the S
     .. automethod:: aiosmtplib.SMTP.__init__
 
 
+Capability Snapshots
+--------------------
+
+.. autoclass:: aiosmtplib.CapabilitySnapshot
+    :members:
+
+
 Server Responses
 ----------------
 

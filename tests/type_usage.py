@@ -47,3 +47,18 @@ async def send_message_async_context_manager() -> None:
     message = email.message.EmailMessage()
     async with aiosmtplib.SMTP(hostname="smtp.example.com") as smtp:
         await smtp.send_message(message)
+
+
+def capability_snapshot_usage(smtp: aiosmtplib.SMTP) -> tuple[int, str, bool] | None:
+    smtp.add_capabilities_observer(lambda new_snapshot: None)
+    smtp.add_extension_selector(
+        lambda current: ["SMTPUTF8"] if current is not None else []
+    )
+    snapshot = smtp.capabilities
+    if snapshot is None:
+        return None
+    return (
+        snapshot.generation,
+        snapshot.phase,
+        snapshot.supports_esmtp and snapshot.supports_extension("smtputf8"),
+    )
