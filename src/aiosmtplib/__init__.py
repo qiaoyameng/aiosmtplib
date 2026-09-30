@@ -28,6 +28,7 @@ from .errors import (
     SMTPServerDisconnected,
     SMTPTimeoutError,
 )
+from .plan import SendPlan
 from .response import SMTPResponse
 from .smtp import SMTP
 from .typing import SMTPStatus, SMTPTokenGenerator
@@ -41,6 +42,7 @@ __all__ = (
     "send",
     "SMTP",
     "SMTPResponse",
+    "SendPlan",
     "SMTPStatus",
     "SMTPTokenGenerator",
     "SMTPAuthenticationError",

@@ -4,6 +4,14 @@ Changelog
 5.1.4 (unreleased)
 ------------------
 
+- Feature: added ``SMTP.plan_message``, which analyzes a message before
+  sending and returns a ``SendPlan`` describing the envelope, mail options and
+  serialized message that would be sent, whether SMTPUTF8 and 8BITMIME are
+  required, and which downgrades would be applied. ``send_message`` now uses
+  the same planning rules: non-ASCII address domains are IDNA encoded instead
+  of requiring SMTPUTF8, non-ASCII header text is RFC 2047 encoded, and
+  messages with non-ASCII address local parts (which cannot be downgraded)
+  fail before ``MAIL FROM`` when the server does not support SMTPUTF8
 - Bugfix: ``SMTPRecipientsRefused`` now exposes the ``message`` attribute shared
   by all ``SMTPException`` subclasses
 - Bugfix: resolve the ``SMTPProtocol`` close waiter on connection loss, so

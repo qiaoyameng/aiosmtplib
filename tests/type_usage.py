@@ -47,3 +47,10 @@ async def send_message_async_context_manager() -> None:
     message = email.message.EmailMessage()
     async with aiosmtplib.SMTP(hostname="smtp.example.com") as smtp:
         await smtp.send_message(message)
+
+
+async def plan_message_async_context_manager() -> None:
+    message = email.message.EmailMessage()
+    async with aiosmtplib.SMTP(hostname="smtp.example.com") as smtp:
+        plan: aiosmtplib.SendPlan = await smtp.plan_message(message)
+        print(plan.smtputf8, plan.eightbitmime, plan.downgrades)

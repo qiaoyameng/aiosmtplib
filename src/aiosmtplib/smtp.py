@@ -20,7 +20,6 @@ from .auth import (
 from .email import (
     extract_recipients,
     extract_sender,
-    flatten_message,
     parse_address,
     quote_address,
 )
@@ -40,6 +39,7 @@ from .errors import (
     SMTPConnectResponseError,
 )
 from .esmtp import parse_esmtp_extensions
+from .plan import SendPlan, build_send_plan
 from .protocol import SMTPProtocol, normalize_message_line_endings
 from .response import SMTPResponse
 from .typing import Default, SMTPStatus, SMTPTokenGenerator, SocketPathType
@@ -1518,6 +1518,64 @@ class SMTP:
 
         return formatted_errors
 
+    async def plan_message(
+        self,
+        message: email.message.EmailMessage | email.message.Message,
+        /,
+        *,
+        sender: str | None = None,
+        recipients: str | Sequence[str] | None = None,
+        mail_options: Iterable[str] | None = None,
+    ) -> SendPlan:
+        r"""
+        Analyze a message and work out how it would be sent, without sending
+        anything.
+
+        Arguments are as for :meth:`.send_message`. The returned
+        :class:`.SendPlan` describes the envelope, mail options and serialized
+        message that :meth:`.send_message` would use, whether the SMTPUTF8 and
+        8BITMIME extensions are required, and which standards based downgrades
+        (IDNA encoded domains, RFC 2047 encoded headers, 7bit body encoding)
+        would be applied. Non-ASCII address local parts cannot be downgraded,
+        and are never transliterated.
+
+        'Resent-Date' is a mandatory field if the message is resent (RFC 2822
+        Section 3.6.6). In such a case, we use the 'Resent-\*' fields.
+        However, if there is more than one 'Resent-' block there's no way to
+        unambiguously determine which one is the most recent in all cases,
+        so rather than guess we raise a ``ValueError`` in that case.
+
+        :raises ValueError:
+            on more than one Resent header block
+            on no sender kwarg or From header in message
+            on no recipients kwarg or To, Cc or Bcc header in message
+        :raises SMTPNotSupported: the message requires SMTPUTF8, but the
+            server does not support it
+        """
+        if sender is None:
+            sender = extract_sender(message)
+        if sender is None:
+            raise ValueError("No From header provided in message")
+
+        if isinstance(recipients, str):
+            recipients = [recipients]
+        elif recipients is None:
+            recipients = extract_recipients(message)
+        if not recipients:
+            raise ValueError("No recipient headers provided in message")
+
+        # Make sure we've done an EHLO for extension checks
+        await self._ehlo_or_helo_if_needed()
+
+        return build_send_plan(
+            message,
+            sender=sender,
+            recipients=recipients,
+            mail_options=mail_options,
+            smtputf8_supported=self.supports_extension("smtputf8"),
+            eightbitmime_supported=self.supports_extension("8BITMIME"),
+        )
+
     async def send_message(
         self,
         message: email.message.EmailMessage | email.message.Message,
@@ -1551,60 +1609,20 @@ class SMTP:
             on more than one Resent header block
             on no sender kwarg or From header in message
             on no recipients kwarg or To, Cc or Bcc header in message
+        :raises SMTPNotSupported: the message requires SMTPUTF8, but the
+            server does not support it
         :raises SMTPRecipientsRefused: delivery to all recipients failed
         :raises SMTPResponseException: on invalid response
         """
-        if mail_options is None:
-            mail_options = []
-        else:
-            mail_options = list(mail_options)
-
-        if sender is None:
-            sender = extract_sender(message)
-        if sender is None:
-            raise ValueError("No From header provided in message")
-
-        if isinstance(recipients, str):
-            recipients = [recipients]
-        elif recipients is None:
-            recipients = extract_recipients(message)
-        if not recipients:
-            raise ValueError("No recipient headers provided in message")
-
-        # Make sure we've done an EHLO for extension checks
-        await self._ehlo_or_helo_if_needed()
-
-        try:
-            sender.encode("ascii")
-            "".join(recipients).encode("ascii")
-        except UnicodeEncodeError:
-            utf8_required = True
-        else:
-            utf8_required = False
-
-        if utf8_required:
-            if not self.supports_extension("smtputf8"):
-                raise SMTPNotSupported(
-                    "An address containing non-ASCII characters was provided, but "
-                    "SMTPUTF8 is not supported by this server"
-                )
-            elif "smtputf8" not in [option.lower() for option in mail_options]:
-                mail_options.append("SMTPUTF8")
-
-        if self.supports_extension("8BITMIME"):
-            if "body=8bitmime" not in [option.lower() for option in mail_options]:
-                mail_options.append("BODY=8BITMIME")
-            cte_type = "8bit"
-        else:
-            cte_type = "7bit"
-
-        flat_message = flatten_message(message, utf8=utf8_required, cte_type=cte_type)
+        plan = await self.plan_message(
+            message, sender=sender, recipients=recipients, mail_options=mail_options
+        )
 
         return await self.sendmail(
-            sender,
-            recipients,
-            flat_message,
-            mail_options=mail_options,
+            plan.sender,
+            plan.recipients,
+            plan.message,
+            mail_options=plan.mail_options,
             rcpt_options=rcpt_options,
             timeout=timeout,
         )

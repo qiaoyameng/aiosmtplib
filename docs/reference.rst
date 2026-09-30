@@ -34,6 +34,13 @@ Server Responses
     :members:
 
 
+Send Plans
+----------
+
+.. autoclass:: aiosmtplib.SendPlan
+    :members:
+
+
 Status Codes
 ------------
 
