@@ -4,6 +4,7 @@ Tests for authentication encoding utils.
 
 import base64
 import hmac
+import json
 
 import pytest
 from hypothesis import given
@@ -14,6 +15,7 @@ from aiosmtplib.auth import (
     auth_login_encode,
     auth_plain_encode,
     auth_xoauth2_encode,
+    auth_xoauth2_error_status,
 )
 from aiosmtplib.errors import SMTPAuthenticationError
 from aiosmtplib.typing import SMTPStatus
@@ -155,3 +157,49 @@ def test_auth_xoauth2_encode_known_value() -> None:
         b"user=someuser@example.com\x01"
         b"auth=Bearer ya29.vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg\x01\x01"
     )
+
+
+def _b64_json(data: object) -> str:
+    return base64.b64encode(json.dumps(data).encode("utf-8")).decode("ascii")
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["400", "401", "403"],
+    ids=["bad request", "invalid token", "insufficient scope"],
+)
+def test_auth_xoauth2_error_status_valid(status: str) -> None:
+    challenge = _b64_json(
+        {"status": status, "schemes": "bearer", "scope": "https://mail.google.com/"}
+    )
+
+    assert auth_xoauth2_error_status(challenge) == status
+
+
+def test_auth_xoauth2_error_status_bytes_challenge() -> None:
+    challenge = _b64_json({"status": "401"}).encode("ascii")
+
+    assert auth_xoauth2_error_status(challenge) == "401"
+
+
+@pytest.mark.parametrize(
+    "challenge",
+    [
+        "not base64 at all!!!",
+        "",  # empty decodes to empty bytes, not JSON
+        _b64_json(["401"]),  # JSON, but not an object
+        _b64_json({"error": "401"}),  # no status field
+        _b64_json({"status": 401}),  # status is not a string
+        _b64_json({"status": None}),
+    ],
+    ids=[
+        "invalid base64",
+        "empty",
+        "json list",
+        "missing status",
+        "non-string status",
+        "null status",
+    ],
+)
+def test_auth_xoauth2_error_status_invalid_challenge(challenge: str) -> None:
+    assert auth_xoauth2_error_status(challenge) is None

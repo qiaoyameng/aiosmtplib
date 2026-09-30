@@ -45,12 +45,23 @@ as ``oauth_token_generator`` is responsible for returning a valid, non-expired
 token each time it is called. It will be called immediately before the
 ``XOAUTH2`` authentication command is sent to the server.
 
-**Your generator must handle expiry**
+**Automatic retry on expired tokens**
 
-aiosmtplib does not track token expiry times or automatically retry on
-authentication failure. Your callable should check if the token is expired
-and refresh it before returning. Some libraries (e.g. ``google-auth``,
-documented below) will handle this.
+If the server rejects the token with an XOAUTH2 error challenge that
+explicitly reports the credentials as invalid or expired (JSON status
+``401``), aiosmtplib calls the generator again to get a fresh token and
+retries authentication exactly once. Other failures — insufficient
+permissions (status ``403``), transient server errors (4xx replies), and
+protocol errors — never trigger a retry, and the generator is never called
+more than twice per connection attempt.
+
+Tokens are never written to logs or included in exception messages.
+
+**Your generator should still handle expiry**
+
+The retry is a safety net, not a refresh strategy. Your callable should check
+if the token is expired and refresh it before returning. Some libraries (e.g.
+``google-auth``, documented below) will handle this.
 
 
 Gmail Example

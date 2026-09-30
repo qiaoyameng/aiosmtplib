@@ -16,6 +16,7 @@ from .auth import (
     auth_login_encode,
     auth_plain_encode,
     auth_xoauth2_encode,
+    auth_xoauth2_error_status,
 )
 from .email import (
     extract_recipients,
@@ -587,13 +588,39 @@ class SMTP:
                 raise SMTPException(
                     "oauth_token_generator provided but server does not support XOAUTH2"
                 )
-            token = await self._oauth_token_generator()
-            await self.auth_xoauth2(self._login_username, token)
+            await self._login_with_oauth_token_generator(
+                self._login_username, self._oauth_token_generator
+            )
         elif self._login_username is not None:
             login_password = (
                 self._login_password if self._login_password is not None else ""
             )
             await self.login(self._login_username, login_password)
+
+    async def _login_with_oauth_token_generator(
+        self, username: str | bytes, token_generator: SMTPTokenGenerator
+    ) -> None:
+        """
+        Fetch a token from the generator and authenticate with it.
+
+        If the server rejects the token with an XOAUTH2 error challenge that
+        explicitly marks the credentials as invalid or expired (JSON status
+        "401") and ends the exchange with an authentication failure, fetch a
+        fresh token and retry exactly once. Transient server failures and
+        protocol errors never trigger a refresh. The token is never included
+        in logs or exceptions.
+        """
+        token = await token_generator()
+        try:
+            await self.auth_xoauth2(username, token)
+        except SMTPAuthenticationError as exc:
+            refreshable = (
+                exc.code == SMTPStatus.auth_failed and exc.xoauth2_error_status == "401"
+            )
+            if not refreshable:
+                raise
+            token = await token_generator()
+            await self.auth_xoauth2(username, token)
 
     async def execute_command(
         self,
@@ -1327,12 +1354,20 @@ class SMTP:
             b"AUTH", b"XOAUTH2", encoded, timeout=timeout
         )
 
-        if response.code == SMTPStatus.auth_continue:
-            # Server sent an error challenge; send empty response to get final error
+        error_status: str | None = None
+        while response.code == SMTPStatus.auth_continue:
+            # Server sent an error challenge; answer with an empty response to
+            # terminate the SASL exchange and get the next challenge or the
+            # final error response.
+            challenge_status = auth_xoauth2_error_status(response.message)
+            if challenge_status is not None:
+                error_status = challenge_status
             response = await self.execute_command(b"", timeout=timeout)
 
         if response.code != SMTPStatus.auth_successful:
-            raise SMTPAuthenticationError(response.code, response.message)
+            raise SMTPAuthenticationError(
+                response.code, response.message, xoauth2_error_status=error_status
+            )
 
         return response
 

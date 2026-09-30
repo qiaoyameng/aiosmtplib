@@ -99,7 +99,16 @@ class SMTPDataError(SMTPResponseException):
 class SMTPAuthenticationError(SMTPResponseException):
     """
     Server refused our AUTH request; may be caused by invalid credentials.
+
+    For XOAUTH2 failures, ``xoauth2_error_status`` holds the ``status`` field
+    of the server's JSON error challenge (e.g. "401"), if one was sent.
     """
+
+    def __init__(
+        self, code: int, message: str, /, *, xoauth2_error_status: str | None = None
+    ) -> None:
+        super().__init__(code, message)
+        self.xoauth2_error_status = xoauth2_error_status
 
 
 class SMTPSenderRefused(SMTPResponseException):

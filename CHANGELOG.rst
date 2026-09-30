@@ -4,6 +4,15 @@ Changelog
 5.1.4 (unreleased)
 ------------------
 
+- Feature: when using ``oauth_token_generator``, an XOAUTH2 error challenge
+  that explicitly reports the token as invalid or expired (JSON status
+  ``401``) now triggers exactly one token refresh and authentication retry.
+  Insufficient permissions (``403``), transient server errors, and protocol
+  errors never trigger a refresh
+- Bugfix: ``auth_xoauth2`` now answers every server error challenge with an
+  empty response, properly terminating the SASL exchange before raising or
+  retrying, and the raised ``SMTPAuthenticationError`` exposes the parsed
+  challenge status as ``xoauth2_error_status``
 - Bugfix: ``SMTPRecipientsRefused`` now exposes the ``message`` attribute shared
   by all ``SMTPException`` subclasses
 - Bugfix: resolve the ``SMTPProtocol`` close waiter on connection loss, so

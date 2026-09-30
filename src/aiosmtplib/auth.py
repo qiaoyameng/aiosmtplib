@@ -5,6 +5,7 @@ Authentication related methods.
 import base64
 import binascii
 import hmac
+import json
 
 from .errors import SMTPAuthenticationError
 from .typing import SMTPStatus
@@ -14,6 +15,7 @@ __all__ = (
     "auth_login_encode",
     "auth_plain_encode",
     "auth_xoauth2_encode",
+    "auth_xoauth2_error_status",
 )
 
 
@@ -106,3 +108,26 @@ def auth_xoauth2_encode(
     encoded = base64.b64encode(auth_string)
 
     return encoded
+
+
+def auth_xoauth2_error_status(challenge: str | bytes, /) -> str | None:
+    """
+    Parse the base64 encoded JSON error challenge sent by the server on
+    XOAUTH2 failure, and return its ``status`` field (e.g. "401").
+
+    Returns None if the challenge is not valid base64 encoded JSON with a
+    string status field. The challenge content is never included in any
+    exception, as it may contain sensitive data.
+    """
+    challenge_bytes = _ensure_bytes(challenge)
+    try:
+        decoded = base64.b64decode(challenge_bytes, validate=True)
+        error = json.loads(decoded)
+    except (binascii.Error, ValueError):
+        return None
+
+    if not isinstance(error, dict):
+        return None
+
+    status = error.get("status")
+    return status if isinstance(status, str) else None
