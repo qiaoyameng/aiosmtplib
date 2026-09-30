@@ -47,3 +47,28 @@ async def send_message_async_context_manager() -> None:
     message = email.message.EmailMessage()
     async with aiosmtplib.SMTP(hostname="smtp.example.com") as smtp:
         await smtp.send_message(message)
+
+
+async def sendmail_result_usage() -> None:
+    result: aiosmtplib.SendResult | None
+    async with aiosmtplib.SMTP(hostname="smtp.example.com") as smtp:
+        try:
+            result = await smtp.sendmail_result(
+                "sender@example.com", ["recipient@example.com"], "Hello"
+            )
+        except aiosmtplib.SMTPSendError as exc:
+            result = exc.send_result
+
+    assert result is not None
+    if result.status is aiosmtplib.SendStatus.uncertain:
+        # Do not resend automatically; surface for a human decision.
+        stage: aiosmtplib.SendStage | None = result.stage
+        accepted: tuple[str, ...] = result.accepted_recipients
+        del stage, accepted
+
+
+async def send_message_result_usage() -> None:
+    message = email.message.EmailMessage()
+    async with aiosmtplib.SMTP(hostname="smtp.example.com") as smtp:
+        result: aiosmtplib.SendResult = await smtp.send_message_result(message)
+    assert result.is_delivered

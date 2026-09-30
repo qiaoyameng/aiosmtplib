@@ -4,6 +4,15 @@ Changelog
 5.1.4 (unreleased)
 ------------------
 
+- Feature: ``sendmail_result``/``send_message_result`` return a structured
+  ``SendResult`` that distinguishes an envelope rejection, a body that was not
+  fully submitted, a confirmed (250) acceptance, and an uncertain delivery
+  (the DATA terminator was sent but the final response was lost). The result
+  records the failure ``SendStage`` and the accepted recipients, and is also
+  attached to the raised exception as ``send_result``. Disconnects, timeouts
+  and cancellations during a transaction raise ``SMTPSendError`` (or carry the
+  result on ``CancelledError``) while preserving the original exception chain;
+  uncertain messages are never reset or retried automatically
 - Bugfix: ``SMTPRecipientsRefused`` now exposes the ``message`` attribute shared
   by all ``SMTPException`` subclasses
 - Bugfix: resolve the ``SMTPProtocol`` close waiter on connection loss, so

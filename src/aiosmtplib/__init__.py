@@ -24,10 +24,12 @@ from .errors import (
     SMTPRecipientRefused,
     SMTPRecipientsRefused,
     SMTPResponseException,
+    SMTPSendError,
     SMTPSenderRefused,
     SMTPServerDisconnected,
     SMTPTimeoutError,
 )
+from .result import SendResult, SendStage, SendStatus
 from .response import SMTPResponse
 from .smtp import SMTP
 from .typing import SMTPStatus, SMTPTokenGenerator
@@ -42,6 +44,9 @@ __all__ = (
     "SMTP",
     "SMTPResponse",
     "SMTPStatus",
+    "SendResult",
+    "SendStage",
+    "SendStatus",
     "SMTPTokenGenerator",
     "SMTPAuthenticationError",
     "SMTPConnectError",
@@ -52,6 +57,7 @@ __all__ = (
     "SMTPRecipientRefused",
     "SMTPRecipientsRefused",
     "SMTPResponseException",
+    "SMTPSendError",
     "SMTPSenderRefused",
     "SMTPServerDisconnected",
     "SMTPTimeoutError",

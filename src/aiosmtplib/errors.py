@@ -1,4 +1,10 @@
+from __future__ import annotations
+
 from asyncio import TimeoutError
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .result import SendResult
 
 
 __all__ = (
@@ -11,6 +17,7 @@ __all__ = (
     "SMTPRecipientRefused",
     "SMTPRecipientsRefused",
     "SMTPResponseException",
+    "SMTPSendError",
     "SMTPSenderRefused",
     "SMTPServerDisconnected",
     "SMTPTimeoutError",
@@ -25,9 +32,27 @@ class SMTPException(Exception):
     Base class for all SMTP exceptions.
     """
 
+    #: Structured outcome of the mail transaction this exception ended, if any.
+    send_result: "SendResult | None" = None
+
     def __init__(self, message: str, /) -> None:
         self.message = message
         self.args = (message,)
+
+
+class SMTPSendError(SMTPException):
+    """
+    A mail transaction failed because the connection was lost, a timeout
+    occurred, or it was cancelled.
+
+    The original exception is available as ``__cause__``, and the structured
+    outcome of the transaction, including the failure stage and the recipients
+    the server had already accepted, is available as :attr:`send_result`.
+    """
+
+    def __init__(self, message: str, send_result: "SendResult", /) -> None:
+        super().__init__(message)
+        self.send_result = send_result
 
 
 class SMTPServerDisconnected(SMTPException, ConnectionError):

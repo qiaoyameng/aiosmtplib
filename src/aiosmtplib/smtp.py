@@ -10,7 +10,7 @@ import socket
 import ssl
 from collections.abc import Iterable, Sequence
 from types import TracebackType
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from .auth import (
     auth_crammd5_verify,
     auth_login_encode,
@@ -28,6 +28,7 @@ from .errors import (
     SMTPAuthenticationError,
     SMTPConnectError,
     SMTPConnectTimeoutError,
+    SMTPDataError,
     SMTPException,
     SMTPHeloError,
     SMTPNotSupported,
@@ -35,12 +36,14 @@ from .errors import (
     SMTPRecipientsRefused,
     SMTPResponseException,
     SMTPSenderRefused,
+    SMTPSendError,
     SMTPServerDisconnected,
     SMTPTimeoutError,
     SMTPConnectResponseError,
 )
 from .esmtp import parse_esmtp_extensions
 from .protocol import SMTPProtocol, normalize_message_line_endings
+from .result import SendResult, SendStage, SendStatus
 from .response import SMTPResponse
 from .typing import Default, SMTPStatus, SMTPTokenGenerator, SocketPathType
 
@@ -51,6 +54,19 @@ SMTP_PORT = 25
 SMTP_TLS_PORT = 465
 SMTP_STARTTLS_PORT = 587
 DEFAULT_TIMEOUT = 60
+
+
+def _annotate_data_failure(exc: BaseException, protocol: SMTPProtocol | None) -> None:
+    """
+    Attach the DATA sub-stage reached to an exception raised by a DATA
+    command. The attributes are not part of the exception classes, so a plain
+    assignment would be a type error on (non-SMTPException) cancellations.
+    """
+    if protocol is None:
+        return
+    annotated = cast("Any", exc)
+    annotated.data_stage = protocol.data_stage
+    annotated.data_terminator_sent = protocol.data_terminator_sent
 
 
 def _validate_local_hostname(hostname: str) -> str:
@@ -975,11 +991,18 @@ class SMTP:
 
         try:
             return await self.protocol.execute_data_command(message, timeout=timeout)
-        except (SMTPServerDisconnected, SMTPTimeoutError):
-            self.close()
-            raise
-        except (SMTPResponseException, asyncio.CancelledError):
-            if not self.is_connected:
+        except (
+            SMTPServerDisconnected,
+            SMTPTimeoutError,
+            SMTPResponseException,
+            asyncio.CancelledError,
+        ) as exc:
+            # Record how much of the DATA transaction made it to the wire, so
+            # sendmail can tell an incomplete body from an uncertain delivery.
+            _annotate_data_failure(exc, self.protocol)
+            if isinstance(exc, (SMTPServerDisconnected, SMTPTimeoutError)):
+                self.close()
+            elif not self.is_connected:
                 self.close()
             raise
 
@@ -1409,7 +1432,47 @@ class SMTP:
         :raises ValueError: on an address that can't be safely sent, or if no
             recipients are given
         :raises SMTPRecipientsRefused: delivery to all recipients failed
-        :raises SMTPResponseException: on invalid response
+        :raises SMTPResponseException: on an invalid or refused response; the
+            exception carries a :class:`.result.SendResult` as ``send_result``
+        :raises SMTPSendError: on a disconnect, timeout or cancellation during
+            the transaction; see its ``send_result`` for the failure stage
+
+        For a structured :class:`.result.SendResult` in both success and
+        failure cases, use :meth:`sendmail_result`.
+        """
+        result = await self.sendmail_result(
+            sender,
+            recipients,
+            message,
+            mail_options=mail_options,
+            rcpt_options=rcpt_options,
+            timeout=timeout,
+        )
+
+        return dict(result.refused_recipients), result.response or ""
+
+    async def sendmail_result(
+        self,
+        sender: str,
+        recipients: str | Sequence[str],
+        message: str | bytes,
+        /,
+        *,
+        mail_options: Iterable[str] | None = None,
+        rcpt_options: Iterable[str] | None = None,
+        timeout: float | Literal[Default.token] | None = Default.token,
+    ) -> SendResult:
+        """
+        Perform an entire mail transaction and return its structured
+        :class:`.result.SendResult`.
+
+        On failure the same result is attached to the raised exception as
+        ``send_result``. The connection is dropped on disconnect, timeout or
+        cancellation, and no RSET or retry is attempted once delivery status
+        is uncertain.
+
+        :raises ValueError: on an address that can't be safely sent, or if no
+            recipients are given
         """
         if isinstance(recipients, str):
             recipients = [recipients]
@@ -1440,9 +1503,31 @@ class SMTP:
         if self._sendmail_lock is None:
             self._sendmail_lock = asyncio.Lock()
 
+        accepted_recipient_list: list[str] = []
+        refused_recipients: dict[str, SMTPResponse] = {}
+        stage: SendStage = SendStage.ehlo
+
+        def make_rejected_result(exc: BaseException, stage: SendStage) -> SendResult:
+            return SendResult(
+                status=SendStatus.rejected,
+                stage=stage,
+                sender=sender,
+                accepted_recipients=tuple(accepted_recipient_list),
+                refused_recipients=refused_recipients,
+                error=exc,
+            )
+
+        def failure_stage(exc: BaseException) -> SendStage:
+            # The DATA command annotates exceptions with its exact sub-stage.
+            return getattr(exc, "data_stage", None) or stage
+
         async with self._sendmail_lock:
             # Make sure we've done an EHLO for extension checks
-            await self._ehlo_or_helo_if_needed()
+            try:
+                await self._ehlo_or_helo_if_needed()
+            except SMTPResponseException as exc:
+                exc.send_result = make_rejected_result(exc, SendStage.ehlo)
+                raise
 
             if mailbox_encoding == "utf-8" and not self.supports_extension("smtputf8"):
                 raise SMTPNotSupported("SMTPUTF8 is not supported by this server")
@@ -1460,44 +1545,122 @@ class SMTP:
                 mail_options.insert(0, size_option)
 
             try:
+                stage = SendStage.mail
                 await self.mail(
                     sender,
                     options=mail_options,
                     encoding=mailbox_encoding,
                     timeout=timeout,
                 )
-                recipient_errors = await self._send_recipients(
-                    recipients, rcpt_options, encoding=mailbox_encoding, timeout=timeout
+                stage = SendStage.rcpt
+                refused_recipients = await self._send_recipients(
+                    recipients,
+                    rcpt_options,
+                    encoding=mailbox_encoding,
+                    accepted_recipients=accepted_recipient_list,
+                    timeout=timeout,
                 )
+                stage = SendStage.data
                 response = await self.data(message, timeout=timeout)
-            except (SMTPResponseException, SMTPRecipientsRefused) as exc:
-                # If we got an error, reset the envelope.
+            except (
+                SMTPSenderRefused,
+                SMTPRecipientsRefused,
+                SMTPDataError,
+            ) as exc:
+                # A definite refusal: the server did not accept the message.
+                if isinstance(exc, SMTPRecipientsRefused):
+                    refused_recipients = {
+                        err.recipient: SMTPResponse(err.code, err.message)
+                        for err in exc.recipients
+                    }
+                    stage = SendStage.rcpt
+                elif isinstance(exc, SMTPSenderRefused):
+                    stage = SendStage.mail
+                else:
+                    stage = getattr(exc, "data_stage", None) or SendStage.data
+                exc.send_result = make_rejected_result(exc, stage)
                 try:
                     await self.rset(timeout=timeout)
-                except (ConnectionError, SMTPResponseException):
+                except (
+                    ConnectionError,
+                    SMTPResponseException,
+                    SMTPTimeoutError,
+                ):
                     # If we're disconnected on the reset, or we get a bad
                     # status, don't raise that as it's confusing
                     pass
                 raise exc
-            except asyncio.CancelledError:
+            except (SMTPServerDisconnected, SMTPTimeoutError) as exc:
+                # A lost connection or a timeout. If the DATA terminator made it
+                # onto the wire, the server may already have accepted the
+                # message, so delivery is uncertain and it must not be retried;
+                # otherwise the body was not fully submitted.
+                transaction_stage = failure_stage(exc)
+                terminator_sent = getattr(exc, "data_terminator_sent", False)
+                if (
+                    transaction_stage in (SendStage.data_body, SendStage.data_response)
+                    and terminator_sent
+                ):
+                    status = SendStatus.uncertain
+                elif transaction_stage is SendStage.data:
+                    status = SendStatus.rejected
+                else:
+                    status = SendStatus.incomplete
+                result = SendResult(
+                    status=status,
+                    stage=transaction_stage,
+                    sender=sender,
+                    accepted_recipients=tuple(accepted_recipient_list),
+                    refused_recipients=refused_recipients,
+                    error=exc,
+                )
+                raise SMTPSendError(exc.message, result) from exc
+            except asyncio.CancelledError as exc:
                 # The envelope may be half-open on the server, and a RSET round
                 # trip after a cancellation could block or be cancelled again,
                 # so drop the connection instead.
+                transaction_stage = failure_stage(exc)
+                terminator_sent = getattr(exc, "data_terminator_sent", False)
+                uncertain = (
+                    transaction_stage in (SendStage.data_body, SendStage.data_response)
+                    and terminator_sent
+                )
+                result = SendResult(
+                    status=(
+                        SendStatus.uncertain if uncertain else SendStatus.incomplete
+                    ),
+                    stage=transaction_stage,
+                    sender=sender,
+                    accepted_recipients=tuple(accepted_recipient_list),
+                    refused_recipients=refused_recipients,
+                    error=exc,
+                )
+                cast("Any", exc).send_result = result
                 self.close()
                 raise
 
-        return recipient_errors, response.message
+        return SendResult(
+            status=SendStatus.delivered,
+            sender=sender,
+            accepted_recipients=tuple(accepted_recipient_list),
+            refused_recipients=refused_recipients,
+            response=response.message,
+        )
 
     async def _send_recipients(
         self,
         recipients: Sequence[str],
         options: Iterable[str],
+        accepted_recipients: list[str],
         encoding: str = "ascii",
         timeout: float | Literal[Default.token] | None = Default.token,
     ) -> dict[str, SMTPResponse]:
         """
         Send the recipients given to the server. Used as part of
-        :meth:`.sendmail`.
+        :meth:`.sendmail_result`. Accepted recipients are appended to
+        ``accepted_recipients`` as each 2xx response arrives (so they are known
+        even if a later recipient fails), and a map of refused recipients is
+        returned.
         """
         recipient_errors: list[SMTPRecipientRefused] = []
         for address in recipients:
@@ -1507,6 +1670,8 @@ class SMTP:
                 )
             except SMTPRecipientRefused as exc:
                 recipient_errors.append(exc)
+            else:
+                accepted_recipients.append(address)
 
         if len(recipient_errors) == len(recipients):
             raise SMTPRecipientsRefused(recipient_errors)
@@ -1552,7 +1717,35 @@ class SMTP:
             on no sender kwarg or From header in message
             on no recipients kwarg or To, Cc or Bcc header in message
         :raises SMTPRecipientsRefused: delivery to all recipients failed
-        :raises SMTPResponseException: on invalid response
+        :raises SMTPResponseException: on an invalid or refused response
+        :raises SMTPSendError: on a disconnect, timeout or cancellation
+        """
+        result = await self.send_message_result(
+            message,
+            sender=sender,
+            recipients=recipients,
+            mail_options=mail_options,
+            rcpt_options=rcpt_options,
+            timeout=timeout,
+        )
+
+        return dict(result.refused_recipients), result.response or ""
+
+    async def send_message_result(
+        self,
+        message: email.message.EmailMessage | email.message.Message,
+        /,
+        *,
+        sender: str | None = None,
+        recipients: str | Sequence[str] | None = None,
+        mail_options: Iterable[str] | None = None,
+        rcpt_options: Iterable[str] | None = None,
+        timeout: float | Literal[Default.token] | None = Default.token,
+    ) -> SendResult:
+        """
+        Structured variant of :meth:`send_message`; see
+        :meth:`sendmail_result` for the meaning of the returned
+        :class:`.result.SendResult`.
         """
         if mail_options is None:
             mail_options = []
@@ -1600,7 +1793,7 @@ class SMTP:
 
         flat_message = flatten_message(message, utf8=utf8_required, cte_type=cte_type)
 
-        return await self.sendmail(
+        return await self.sendmail_result(
             sender,
             recipients,
             flat_message,

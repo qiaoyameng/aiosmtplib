@@ -209,6 +209,78 @@ async def mock_response_start_data_disconnect(
     smtpd.transport.close()
 
 
+async def mock_response_data_disconnect_before_data(
+    smtpd: SMTPD, *args: Any, **kwargs: Any
+) -> None:
+    """
+    Close the connection in place of the 354 response to DATA, before any
+    message content is sent.
+    """
+    smtpd.transport.close()
+
+
+async def _read_data_until_terminator(smtpd: SMTPD) -> None:
+    """Consume a DATA payload up to (and including) its terminating dot."""
+    while True:
+        line = await smtpd._reader.readuntil(b"\r\n")
+        if line == b".\r\n":
+            return
+
+
+async def mock_response_data_disconnect_after_terminator(
+    smtpd: SMTPD, *args: Any, **kwargs: Any
+) -> None:
+    """
+    Read the whole message including its terminator, then close without
+    sending the final 250 response. Delivery status is uncertain.
+    """
+    await smtpd.push("354 End data with <CR><LF>.<CR><LF>")
+    await _read_data_until_terminator(smtpd)
+    smtpd.transport.close()
+
+
+async def mock_response_data_ok_then_disconnect(
+    smtpd: SMTPD, *args: Any, **kwargs: Any
+) -> None:
+    """
+    Confirm acceptance with 250, flush it, and only then close. The client has
+    an acknowledged delivery even though the connection drops afterwards.
+    """
+    await smtpd.push("354 End data with <CR><LF>.<CR><LF>")
+    await _read_data_until_terminator(smtpd)
+    await smtpd.push("250 OK")
+    await smtpd._writer.drain()
+    smtpd.transport.close()
+
+
+async def mock_response_data_stall_after_terminator(
+    smtpd: SMTPD, *args: Any, **kwargs: Any
+) -> None:
+    """
+    Accept the whole message, then never answer with a final 250, so the
+    client read times out with delivery status uncertain.
+    """
+    await smtpd.push("354 End data with <CR><LF>.<CR><LF>")
+    await _read_data_until_terminator(smtpd)
+    await asyncio.sleep(10)
+
+
+async def mock_response_rcpt_refuse_specific(
+    smtpd: SMTPD,
+    session: Any,
+    envelope: Any,
+    address: str,
+    rcpt_options: list[str],
+    *args: Any,
+    **kwargs: Any,
+) -> str:
+    """Refuse one specific recipient; accept the others."""
+    if address == "refused@example.com":
+        return f"{SMTPStatus.mailbox_does_not_exist} no such recipient"
+    await smtpd.push(f"{SMTPStatus.completed} OK")
+    return MISSING
+
+
 async def mock_response_start_data_stall(
     smtpd: SMTPD, *args: Any, **kwargs: Any
 ) -> None:

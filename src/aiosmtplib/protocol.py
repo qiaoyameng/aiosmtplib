@@ -15,6 +15,7 @@ from .errors import (
     SMTPServerDisconnected,
     SMTPTimeoutError,
 )
+from .result import SendStage
 from .response import SMTPResponse
 from .typing import SMTPStatus
 
@@ -166,6 +167,9 @@ class SMTPProtocol(FlowControlMixin, asyncio.BaseProtocol):
         self._closed_future: "asyncio.Future[None]" = self._loop.create_future()
         self._quit_sent = False
         self._connection_lost_callback = connection_lost_callback
+        # Mail transaction progress, exposed while a DATA command runs.
+        self.data_stage: SendStage | None = None
+        self.data_terminator_sent = False
 
     def _get_close_waiter(self, stream: asyncio.StreamWriter) -> "asyncio.Future[None]":
         return self._closed_future
@@ -457,6 +461,8 @@ class SMTPProtocol(FlowControlMixin, asyncio.BaseProtocol):
         message += b".\r\n"
 
         async with self._command_lock:
+            self.data_stage = SendStage.data
+            self.data_terminator_sent = False
             # Mark a reply as expected before each send (see execute_command).
             self._response_pending = True
             self.write(b"DATA\r\n")
@@ -464,6 +470,7 @@ class SMTPProtocol(FlowControlMixin, asyncio.BaseProtocol):
             if start_response.code != SMTPStatus.start_input:
                 raise SMTPDataError(start_response.code, start_response.message)
 
+            self.data_stage = SendStage.data_body
             self._response_pending = True
             # Chunk the message and apply write backpressure, so the reply
             # timeout only starts once the whole message has been handed off,
@@ -472,10 +479,17 @@ class SMTPProtocol(FlowControlMixin, asyncio.BaseProtocol):
             for start in range(0, len(view), DATA_CHUNK_SIZE):
                 chunk = bytes(view[start : start + DATA_CHUNK_SIZE])
                 await self._write_and_drain(chunk, timeout)
+            # The whole body, including the terminating <CRLF>.<CRLF>, has
+            # been handed to the transport; a lost connection now leaves the
+            # message's delivery status uncertain.
+            self.data_terminator_sent = True
+            self.data_stage = SendStage.data_response
             response = await self._read_response_or_close(timeout=timeout)
             if response.code != SMTPStatus.completed:
                 raise SMTPDataError(response.code, response.message)
 
+            self.data_stage = None
+            self.data_terminator_sent = False
         return response
 
     async def start_tls(
