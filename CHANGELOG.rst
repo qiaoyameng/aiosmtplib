@@ -4,6 +4,13 @@ Changelog
 5.1.4 (unreleased)
 ------------------
 
+- Feature: ``sendmail`` (and so ``send_message`` and ``send``) now uses
+  PIPELINING (RFC 2920) when the server advertises it, sending ``MAIL FROM``
+  and all ``RCPT TO`` commands in a single batch and pairing the responses to
+  commands in the order sent. ``DATA`` is only sent if ``MAIL FROM`` and at
+  least one recipient were accepted; otherwise every pipelined response is
+  collected (or the connection is closed) before the error is raised, so no
+  reply can be mis-paired with a later command
 - Bugfix: ``SMTPRecipientsRefused`` now exposes the ``message`` attribute shared
   by all ``SMTPException`` subclasses
 - Bugfix: resolve the ``SMTPProtocol`` close waiter on connection loss, so

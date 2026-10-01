@@ -4,6 +4,7 @@ An ``asyncio.Protocol`` subclass for lower level IO handling.
 
 import asyncio
 import collections
+import collections.abc
 import re
 import ssl
 from typing import Any, Callable, TypeVar, cast
@@ -355,6 +356,16 @@ class SMTPProtocol(FlowControlMixin, asyncio.BaseProtocol):
         # command write (e.g. the initial server greeting).
         self._response_pending = True
         try:
+            if self._buffer:
+                # Replies to pipelined commands may arrive coalesced in one
+                # packet; parse any complete response already buffered.
+                try:
+                    buffered_response = self._read_response_from_buffer()
+                except Exception as exc:
+                    self._fail_response(self._response_waiter, exc)
+                else:
+                    if buffered_response is not None:
+                        return buffered_response
             result = await _wait_for_future(self._loop, self._response_waiter, timeout)
         except (TimeoutError, asyncio.TimeoutError) as exc:
             raise SMTPReadTimeoutError("Timed out waiting for server response") from exc
@@ -438,6 +449,38 @@ class SMTPProtocol(FlowControlMixin, asyncio.BaseProtocol):
             response = await self._read_response_or_close(timeout=timeout)
 
         return response
+
+    async def execute_pipelined_commands(
+        self, commands: collections.abc.Sequence[bytes], timeout: float | None = None
+    ) -> list[SMTPResponse]:
+        """
+        Write multiple commands to the server in one batch, then read one
+        response per command, pairing responses to commands in the order
+        sent (RFC 2920 PIPELINING).
+
+        Every response is read before this method returns; if reading is
+        interrupted (disconnect, timeout, cancellation), the connection is
+        closed so no reply can be mis-paired with a later command.
+        """
+        if not commands:
+            raise ValueError("No commands provided")
+        for command in commands:
+            if COMMAND_INJECTION_REGEX.search(command):
+                raise ValueError("Command contains a prohibited control character")
+        if self._command_lock is None:
+            raise SMTPServerDisconnected("Server not connected")
+
+        async with self._command_lock:
+            # Mark a reply as expected before sending, so data arriving after
+            # the write can never be mistaken for unsolicited data.
+            self._response_pending = True
+            self.write(b"".join(command + b"\r\n" for command in commands))
+
+            responses = []
+            for _ in commands:
+                responses.append(await self._read_response_or_close(timeout=timeout))
+
+        return responses
 
     async def execute_data_command(
         self, message: bytes, timeout: float | None = None
