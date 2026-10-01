@@ -4,6 +4,9 @@ Changelog
 5.1.4 (unreleased)
 ------------------
 
+- Feature: ``sendmail`` now uses PIPELINING (RFC 2920) when the server
+  advertises it, sending MAIL and RCPT commands as a single batch instead of
+  waiting for a response per recipient
 - Bugfix: ``SMTPRecipientsRefused`` now exposes the ``message`` attribute shared
   by all ``SMTPException`` subclasses
 - Bugfix: resolve the ``SMTPProtocol`` close waiter on connection loss, so

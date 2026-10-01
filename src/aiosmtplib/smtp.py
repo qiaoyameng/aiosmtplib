@@ -632,6 +632,37 @@ class SMTP:
 
         return response
 
+    async def _execute_pipelined_commands(
+        self,
+        commands: Sequence[bytes],
+        timeout: float | Literal[Default.token] | None = Default.token,
+    ) -> list[SMTPResponse]:
+        """
+        Send a batch of commands without waiting for individual responses
+        (requires the PIPELINING extension), and return the responses paired
+        with each command in send order.
+
+        :raises SMTPServerDisconnected: connection lost
+        """
+        if self.protocol is None:
+            raise SMTPServerDisconnected("Server not connected")
+
+        try:
+            return await self.protocol.execute_pipelined_commands(
+                commands, timeout=self.timeout if timeout is Default.token else timeout
+            )
+        except (SMTPServerDisconnected, SMTPTimeoutError):
+            # Responses already sent by the server may not have been read, so
+            # the connection is desynced (see execute_command).
+            self.close()
+            raise
+        except (SMTPResponseException, asyncio.CancelledError):
+            # The protocol closes its transport on a malformed reply or if
+            # cancelled mid-command
+            if not self.is_connected:
+                self.close()
+            raise
+
     async def _get_tls_context(self) -> ssl.SSLContext:
         """
         Build an SSLContext object from the options we've been given.
@@ -901,18 +932,25 @@ class SMTP:
         if options is None:
             options = []
 
-        quoted_sender = quote_address(sender)
-        addr_bytes = quoted_sender.encode(encoding)
-        options_bytes = [option.encode("ascii") for option in options]
-
         response = await self.execute_command(
-            b"MAIL", b"FROM:" + addr_bytes, *options_bytes, timeout=timeout
+            self._mail_command(sender, options, encoding), timeout=timeout
         )
 
         if response.code != SMTPStatus.completed:
             raise SMTPSenderRefused(response.code, response.message, sender)
 
         return response
+
+    @staticmethod
+    def _mail_command(sender: str, options: Iterable[str], encoding: str) -> bytes:
+        """
+        Build a MAIL command line for the sender and options given.
+        """
+        quoted_sender = quote_address(sender)
+        parts = [b"MAIL", b"FROM:" + quoted_sender.encode(encoding)]
+        parts.extend(option.encode("ascii") for option in options)
+
+        return b" ".join(parts)
 
     async def rcpt(
         self,
@@ -935,18 +973,25 @@ class SMTP:
         if options is None:
             options = []
 
-        quoted_recipient = quote_address(recipient)
-        addr_bytes = quoted_recipient.encode(encoding)
-        options_bytes = [option.encode("ascii") for option in options]
-
         response = await self.execute_command(
-            b"RCPT", b"TO:" + addr_bytes, *options_bytes, timeout=timeout
+            self._rcpt_command(recipient, options, encoding), timeout=timeout
         )
 
         if response.code not in (SMTPStatus.completed, SMTPStatus.will_forward):
             raise SMTPRecipientRefused(response.code, response.message, recipient)
 
         return response
+
+    @staticmethod
+    def _rcpt_command(recipient: str, options: Iterable[str], encoding: str) -> bytes:
+        """
+        Build a RCPT command line for the recipient and options given.
+        """
+        quoted_recipient = quote_address(recipient)
+        parts = [b"RCPT", b"TO:" + quoted_recipient.encode(encoding)]
+        parts.extend(option.encode("ascii") for option in options)
+
+        return b" ".join(parts)
 
     async def data(
         self,
@@ -1367,6 +1412,10 @@ class SMTP:
         If there has been no previous HELO or EHLO command this session, this
         method tries EHLO first.
 
+        If the server advertises the PIPELINING extension, the MAIL and RCPT
+        commands are sent as a single batch (RFC 2920), saving a round trip
+        per recipient; responses are paired with each command in send order.
+
         This method will return normally if the mail is accepted for at least
         one recipient.  It returns a tuple consisting of:
 
@@ -1460,15 +1509,28 @@ class SMTP:
                 mail_options.insert(0, size_option)
 
             try:
-                await self.mail(
-                    sender,
-                    options=mail_options,
-                    encoding=mailbox_encoding,
-                    timeout=timeout,
-                )
-                recipient_errors = await self._send_recipients(
-                    recipients, rcpt_options, encoding=mailbox_encoding, timeout=timeout
-                )
+                if self.supports_extension("pipelining"):
+                    recipient_errors = await self._send_envelope_pipelined(
+                        sender,
+                        recipients,
+                        mail_options,
+                        rcpt_options,
+                        encoding=mailbox_encoding,
+                        timeout=timeout,
+                    )
+                else:
+                    await self.mail(
+                        sender,
+                        options=mail_options,
+                        encoding=mailbox_encoding,
+                        timeout=timeout,
+                    )
+                    recipient_errors = await self._send_recipients(
+                        recipients,
+                        rcpt_options,
+                        encoding=mailbox_encoding,
+                        timeout=timeout,
+                    )
                 response = await self.data(message, timeout=timeout)
             except (SMTPResponseException, SMTPRecipientsRefused) as exc:
                 # If we got an error, reset the envelope.
@@ -1517,6 +1579,52 @@ class SMTP:
         }
 
         return formatted_errors
+
+    async def _send_envelope_pipelined(
+        self,
+        sender: str,
+        recipients: Sequence[str],
+        mail_options: Iterable[str],
+        rcpt_options: Iterable[str],
+        encoding: str = "ascii",
+        timeout: float | Literal[Default.token] | None = Default.token,
+    ) -> dict[str, SMTPResponse]:
+        """
+        Send the MAIL and RCPT commands for a mail transaction as a single
+        pipelined batch (RFC 2920), pairing each response with its command
+        in send order. Used as part of :meth:`.sendmail` when the server
+        advertises the PIPELINING extension.
+
+        Every response is collected before returning (or the connection is
+        closed), so a refused sender or recipient never leaves unread
+        responses that could be paired with later commands.
+        """
+        commands = [self._mail_command(sender, mail_options, encoding)]
+        commands.extend(
+            self._rcpt_command(recipient, rcpt_options, encoding)
+            for recipient in recipients
+        )
+
+        responses = await self._execute_pipelined_commands(commands, timeout=timeout)
+
+        mail_response = responses[0]
+        if mail_response.code != SMTPStatus.completed:
+            raise SMTPSenderRefused(mail_response.code, mail_response.message, sender)
+
+        recipient_errors: list[SMTPRecipientRefused] = []
+        for recipient, response in zip(recipients, responses[1:], strict=True):
+            if response.code not in (SMTPStatus.completed, SMTPStatus.will_forward):
+                recipient_errors.append(
+                    SMTPRecipientRefused(response.code, response.message, recipient)
+                )
+
+        if len(recipient_errors) == len(recipients):
+            raise SMTPRecipientsRefused(recipient_errors)
+
+        return {
+            err.recipient: SMTPResponse(err.code, err.message)
+            for err in recipient_errors
+        }
 
     async def send_message(
         self,

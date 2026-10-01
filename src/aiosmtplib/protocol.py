@@ -6,6 +6,7 @@ import asyncio
 import collections
 import re
 import ssl
+from collections.abc import Sequence
 from typing import Any, Callable, TypeVar, cast
 
 from .errors import (
@@ -160,6 +161,12 @@ class SMTPProtocol(FlowControlMixin, asyncio.BaseProtocol):
         # otherwise be stored on the (freshly created) waiter and mis-paired
         # with the next command's response.
         self._response_pending = False
+        # While a pipelined command batch is in flight, responses that arrive
+        # before their predecessors have been collected are queued here (in
+        # arrival order), along with any framing error that ends the batch.
+        self._pipelined_responses: (
+            collections.deque[SMTPResponse | BaseException] | None
+        ) = None
 
         self.transport: asyncio.BaseTransport | None = None
         self._command_lock: asyncio.Lock | None = None
@@ -221,6 +228,29 @@ class SMTPProtocol(FlowControlMixin, asyncio.BaseProtocol):
             # data_received callback still fired; there is nothing to deliver
             # the data to, so drop it.
             return
+        elif self._pipelined_responses is not None:
+            # A pipelined batch is in flight: parse every complete response
+            # and queue them in arrival order for execute_pipelined_commands.
+            self._buffer.extend(data)
+            if len(self._buffer) > MAX_RESPONSE_LENGTH:
+                self._fail_pipelined_responses(
+                    SMTPResponseException(
+                        SMTPStatus.invalid_response.value, "Response too long"
+                    )
+                )
+                return
+            while True:
+                try:
+                    response = self._read_response_from_buffer()
+                except Exception as exc:
+                    self._fail_pipelined_responses(exc)
+                    return
+                if response is None:
+                    return
+                if not self._response_waiter.done():
+                    self._response_waiter.set_result(response)
+                else:
+                    self._pipelined_responses.append(response)
         elif not self._response_pending or self._response_waiter.done():
             # We got data without an outstanding command (or a response is
             # already parsed and awaiting pickup); ignore it so it can't be
@@ -265,6 +295,20 @@ class SMTPProtocol(FlowControlMixin, asyncio.BaseProtocol):
         """
         del self._buffer[:]
         self._set_response_exception(waiter, exc)
+        if self.transport is not None and not self.transport.is_closing():
+            self.transport.close()
+
+    def _fail_pipelined_responses(self, exc: BaseException) -> None:
+        """
+        Fail a pipelined command batch with a framing error and drop the
+        connection (see _fail_response). The error is delivered after any
+        responses that were already parsed, so ordering is preserved.
+        """
+        del self._buffer[:]
+        if self._response_waiter is not None and not self._response_waiter.done():
+            self._set_response_exception(self._response_waiter, exc)
+        elif self._pipelined_responses is not None:
+            self._pipelined_responses.append(exc)
         if self.transport is not None and not self.transport.is_closing():
             self.transport.close()
 
@@ -438,6 +482,55 @@ class SMTPProtocol(FlowControlMixin, asyncio.BaseProtocol):
             response = await self._read_response_or_close(timeout=timeout)
 
         return response
+
+    async def _read_pipelined_response(self, timeout: float | None) -> SMTPResponse:
+        """
+        Read the next response to a pipelined command batch. Responses are
+        collected in send order: any that arrived while a previous response
+        was being awaited are queued in ``_pipelined_responses``.
+        """
+        assert self._pipelined_responses is not None
+        if self._pipelined_responses:
+            queued = self._pipelined_responses.popleft()
+            if isinstance(queued, BaseException):
+                raise queued
+            return queued
+
+        return await self._read_response_or_close(timeout=timeout)
+
+    async def execute_pipelined_commands(
+        self, commands: Sequence[bytes], timeout: float | None = None
+    ) -> list[SMTPResponse]:
+        """
+        Send multiple SMTP commands without waiting for individual responses
+        (RFC 2920 PIPELINING), and return the responses paired with each
+        command in send order.
+
+        All responses are collected before this method returns; if the
+        exchange fails partway through, the connection is closed so that
+        unread responses cannot be paired with later commands.
+        """
+        for command in commands:
+            if COMMAND_INJECTION_REGEX.search(command):
+                raise ValueError("Command contains a prohibited control character")
+        if not commands:
+            return []
+        if self._command_lock is None:
+            raise SMTPServerDisconnected("Server not connected")
+
+        async with self._command_lock:
+            # Mark replies as expected before sending (see execute_command).
+            self._response_pending = True
+            self._pipelined_responses = collections.deque()
+            try:
+                self.write(b"\r\n".join(commands) + b"\r\n")
+                responses = []
+                for _ in commands:
+                    responses.append(await self._read_pipelined_response(timeout))
+            finally:
+                self._pipelined_responses = None
+
+        return responses
 
     async def execute_data_command(
         self, message: bytes, timeout: float | None = None
